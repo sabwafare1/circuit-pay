@@ -4,6 +4,7 @@ import io
 import os
 import sys
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -159,6 +160,44 @@ class CmdBalanceTests(unittest.TestCase):
             xrpcli.cmd_balance(make_balance_args())
 
         self.assertIn("account not found", str(ctx.exception))
+
+    @patch("xrpcli.rpc_call")
+    def test_surfaces_error_message_for_unmapped_rpc_error(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "error",
+                "error": "someUnmappedCode",
+                "error_message": "Something specific went wrong.",
+            }
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_balance(make_balance_args())
+
+        self.assertIn("Something specific went wrong.", str(ctx.exception))
+
+    @patch("xrpcli.rpc_call")
+    def test_surfaces_raw_error_code_when_no_message_available(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {"status": "error", "error": "someUnmappedCode"}
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_balance(make_balance_args())
+
+        self.assertIn("someUnmappedCode", str(ctx.exception))
+
+
+class RpcCallTests(unittest.TestCase):
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_raises_clean_error_when_network_unreachable(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("Name or service not known")
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.rpc_call(xrpcli.NETWORKS["mainnet"], "account_info", {})
+
+        self.assertIn("failed to reach", str(ctx.exception))
+        self.assertIn(xrpcli.NETWORKS["mainnet"], str(ctx.exception))
 
 
 class CmdPriceTests(unittest.TestCase):
