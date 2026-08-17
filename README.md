@@ -142,6 +142,19 @@ python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network m
   to the same address
 - `--network` — which XRPL network the request should be paid on (default: `mainnet`)
 
+**Error handling:** all validation happens before anything is written to
+the local request store, so a rejected request never leaves a partial
+entry behind:
+
+- **Invalid address** — `error: '<address>' is not a valid XRPL wallet
+  address` (same base58check validation used by `history`/`balance`)
+- **Invalid amount** — `error: '<amount>' is not a valid XRP amount` for
+  non-numeric input, `error: amount must be greater than zero` for
+  zero/negative amounts, or `error: XRP amounts support at most 6 decimal
+  places` if it has more precision than a drop can represent
+- **`--tag` out of range** — `error: --tag must be between 0 and
+  4294967295` if given a value outside XRPL's 32-bit destination tag range
+
 **Tests:** `tests/test_xrpcli.py::CmdRequestTests` mocks `load_requests`/
 `save_requests` so no test ever touches the real `requests.json` on disk.
 It checks that: an invalid address, invalid amount, or out-of-range `--tag`
