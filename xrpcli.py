@@ -17,6 +17,8 @@ NETWORKS = {
     "devnet": "https://s.devnet.rippletest.net:51234",
 }
 
+PRICE_API_URL = "https://api.coingecko.com/api/v3/simple/price"
+
 # Ripple's base58 alphabet (different ordering than Bitcoin's).
 XRPL_B58_ALPHABET = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz"
 
@@ -84,6 +86,25 @@ def format_time(ripple_ts):
     return (RIPPLE_EPOCH + datetime.timedelta(seconds=ripple_ts)).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
+
+
+def fetch_price(currency):
+    url = f"{PRICE_API_URL}?ids=ripple&vs_currencies={urllib.parse.quote(currency)}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.load(resp)
+    except urllib.error.URLError as e:
+        raise SystemExit(f"error: failed to reach price API: {e}")
+
+
+def cmd_price(args):
+    currency = args.currency.lower()
+    data = fetch_price(currency)
+    price = data.get("ripple", {}).get(currency)
+    if price is None:
+        raise SystemExit(f"error: no price data for currency '{currency}'")
+    print(f"1 XRP = {price} {currency.upper()}")
 
 
 def cmd_history(args):
@@ -228,6 +249,14 @@ def build_parser():
         help="XRPL network to query (default: mainnet)",
     )
     balance.set_defaults(func=cmd_balance)
+
+    price = subparsers.add_parser("price", help="check the current XRP price")
+    price.add_argument(
+        "--currency",
+        default="usd",
+        help="fiat currency to price XRP in (default: usd)",
+    )
+    price.set_defaults(func=cmd_price)
 
     request = subparsers.add_parser(
         "request", help="create a payment request for a customer to pay"

@@ -25,6 +25,10 @@ def make_balance_args(address=VALID_ADDRESS, network="mainnet"):
     return argparse.Namespace(address=address, network=network)
 
 
+def make_price_args(currency="usd"):
+    return argparse.Namespace(currency=currency)
+
+
 class IsValidClassicAddressTests(unittest.TestCase):
     def test_accepts_valid_address(self):
         self.assertTrue(xrpcli.is_valid_classic_address(VALID_ADDRESS))
@@ -143,6 +147,38 @@ class CmdBalanceTests(unittest.TestCase):
             xrpcli.cmd_balance(make_balance_args())
 
         self.assertIn("account not found", str(ctx.exception))
+
+
+class CmdPriceTests(unittest.TestCase):
+    @patch("xrpcli.fetch_price")
+    def test_prints_price_on_success(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {"usd": 1.001}}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_price(make_price_args())
+
+        self.assertIn("1 XRP = 1.001 USD", buf.getvalue())
+
+    @patch("xrpcli.fetch_price")
+    def test_lowercases_currency_before_lookup(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {"eur": 0.864225}}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_price(make_price_args(currency="EUR"))
+
+        mock_fetch_price.assert_called_once_with("eur")
+        self.assertIn("1 XRP = 0.864225 EUR", buf.getvalue())
+
+    @patch("xrpcli.fetch_price")
+    def test_raises_when_currency_missing_from_response(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {}}
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_price(make_price_args(currency="notarealcurrency"))
+
+        self.assertIn("no price data for currency", str(ctx.exception))
 
 
 class XrpToDropsTests(unittest.TestCase):
