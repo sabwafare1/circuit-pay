@@ -228,6 +228,33 @@ $ python xrpcli.py history r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD --network testnet 
 2026-08-17 04:04:10 UTC  Payment      hash=B3737CEDEC9839126D98638E1478330AD9347E38A54ED184DDBC52A84A03435F  result=tesSUCCESS
 ```
 
+**Error handling:** `pay` checks things in order, before ever attempting to
+sign or submit anything:
+
+1. **Unknown request ID** — `error: no payment request found with id '<id>'`
+2. **Already paid** — `error: request '<id>' was already paid (tx hash=<hash>)`,
+   so the same request can never be paid twice
+3. **Missing `XRPL_SECRET`** — `error: set the XRPL_SECRET environment
+   variable to your wallet's secret (seed) before paying`
+4. **`xrpl-py` not installed** — `error: the 'xrpl-py' package is required
+   to send payments. Install it with: pip install -r requirements.txt`
+   (only this command needs the dependency; the rest of the CLI still
+   works without it)
+5. **Invalid secret** — if `Wallet.from_seed` rejects the value, `error:
+   invalid XRPL_SECRET: <underlying reason>`
+
+Only after all of that does it build and submit the transaction. Failures
+from there are also surfaced as clean errors rather than raw tracebacks:
+
+- **Submission/network failure** (unreachable node, unfunded sender
+  account, bad autofill, etc.) — `error: payment submission failed:
+  <underlying xrpl-py exception>`
+- **On-ledger failure** — if the transaction is submitted but doesn't
+  validate with `tesSUCCESS` (e.g. `tecUNFUNDED_PAYMENT`,
+  `tecNO_DST_INSUFF_XRP`) — `error: payment failed with result '<code>'`.
+  In this case the request is **left `pending`**, not marked paid, so it
+  can be retried.
+
 **Tests:** `tests/test_xrpcli.py::CmdPayTests` covers `pay` end to end without
 ever touching the real network or moving funds — the request store and the
 `xrpl-py` `Wallet`/`submit_and_wait`/`JsonRpcClient` calls are all mocked.
