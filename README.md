@@ -314,6 +314,11 @@ touching the real `requests.json` or the network (`load_requests` /
   `tecUNFUNDED_PAYMENT` result, asserts the entry's `status` is left
   unchanged as `"pending"` and `save_requests` is **not** called, so a
   failed payment never gets recorded as paid
+- `test_reports_submission_failure` — with a mocked `submit_and_wait` that
+  raises (e.g. an unreachable node), asserts the same thing one step
+  earlier: `status` stays `"pending"` and `save_requests` is never called,
+  so a submission that never even reached the ledger can't be mistaken
+  for a paid one either
 - `test_rejects_already_paid_request` — seeds the store with an entry
   whose `status` is already `"paid"`, and asserts `pay` raises before
   doing anything else, with the error message including the existing
