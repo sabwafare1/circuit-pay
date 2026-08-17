@@ -107,6 +107,32 @@ def cmd_price(args):
     print(f"1 XRP = {price} {currency.upper()}")
 
 
+def cmd_convert(args):
+    unit = args.unit.lower()
+    if unit not in ("xrp", "usd"):
+        raise SystemExit(f"error: unit must be 'xrp' or 'usd', got '{args.unit}'")
+
+    try:
+        amount = decimal.Decimal(args.amount)
+    except decimal.InvalidOperation:
+        raise SystemExit(f"error: '{args.amount}' is not a valid amount")
+    if amount <= 0:
+        raise SystemExit("error: amount must be greater than zero")
+
+    data = fetch_price("usd")
+    price = data.get("ripple", {}).get("usd")
+    if price is None:
+        raise SystemExit("error: no price data available for usd")
+    rate = decimal.Decimal(str(price))
+
+    if unit == "xrp":
+        converted = amount * rate
+        print(f"{amount} XRP = {converted:.2f} USD (rate: 1 XRP = {rate} USD)")
+    else:
+        converted = amount / rate
+        print(f"{amount} USD = {converted:.6f} XRP (rate: 1 XRP = {rate} USD)")
+
+
 def cmd_history(args):
     if not is_valid_classic_address(args.address):
         raise SystemExit(
@@ -257,6 +283,13 @@ def build_parser():
         help="fiat currency to price XRP in (default: usd)",
     )
     price.set_defaults(func=cmd_price)
+
+    convert = subparsers.add_parser(
+        "convert", help="convert an amount between XRP and USD"
+    )
+    convert.add_argument("amount", help="amount to convert")
+    convert.add_argument("unit", help="unit of the amount to convert from: xrp or usd")
+    convert.set_defaults(func=cmd_convert)
 
     request = subparsers.add_parser(
         "request", help="create a payment request for a customer to pay"

@@ -29,6 +29,10 @@ def make_price_args(currency="usd"):
     return argparse.Namespace(currency=currency)
 
 
+def make_convert_args(amount="100", unit="xrp"):
+    return argparse.Namespace(amount=amount, unit=unit)
+
+
 class IsValidClassicAddressTests(unittest.TestCase):
     def test_accepts_valid_address(self):
         self.assertTrue(xrpcli.is_valid_classic_address(VALID_ADDRESS))
@@ -215,6 +219,73 @@ class CmdPriceTests(unittest.TestCase):
 
         self.assertIn("1 XRP = 150 JPY", buf.getvalue())
         self.assertNotIn("150.0", buf.getvalue())
+
+
+class CmdConvertTests(unittest.TestCase):
+    @patch("xrpcli.fetch_price")
+    def test_converts_xrp_to_usd(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {"usd": 1.001}}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_convert(make_convert_args(amount="100", unit="xrp"))
+
+        output = buf.getvalue()
+        self.assertIn("100 XRP = 100.10 USD", output)
+        self.assertIn("rate: 1 XRP = 1.001 USD", output)
+
+    @patch("xrpcli.fetch_price")
+    def test_converts_usd_to_xrp(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {"usd": 1.001}}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_convert(make_convert_args(amount="50", unit="usd"))
+
+        self.assertIn("50 USD = 49.950050 XRP", buf.getvalue())
+
+    @patch("xrpcli.fetch_price")
+    def test_unit_is_case_insensitive(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {"usd": 1.001}}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_convert(make_convert_args(amount="10", unit="XRP"))
+
+        self.assertIn("10 XRP = 10.01 USD", buf.getvalue())
+
+    @patch("xrpcli.fetch_price")
+    def test_rejects_invalid_unit_without_fetching_price(self, mock_fetch_price):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_convert(make_convert_args(unit="eur"))
+
+        self.assertIn("unit must be 'xrp' or 'usd'", str(ctx.exception))
+        mock_fetch_price.assert_not_called()
+
+    @patch("xrpcli.fetch_price")
+    def test_rejects_non_numeric_amount(self, mock_fetch_price):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_convert(make_convert_args(amount="abc"))
+
+        self.assertIn("not a valid amount", str(ctx.exception))
+        mock_fetch_price.assert_not_called()
+
+    @patch("xrpcli.fetch_price")
+    def test_rejects_zero_or_negative_amount(self, mock_fetch_price):
+        with self.assertRaises(SystemExit):
+            xrpcli.cmd_convert(make_convert_args(amount="0"))
+        with self.assertRaises(SystemExit):
+            xrpcli.cmd_convert(make_convert_args(amount="-5"))
+        mock_fetch_price.assert_not_called()
+
+    @patch("xrpcli.fetch_price")
+    def test_raises_when_no_usd_price_available(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {}}
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_convert(make_convert_args())
+
+        self.assertIn("no price data available", str(ctx.exception))
 
 
 class XrpToDropsTests(unittest.TestCase):
