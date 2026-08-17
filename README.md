@@ -151,3 +151,14 @@ $ python xrpcli.py pay 9cc8e589
 Sending 12.5 XRP from rPayerAddress... to rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh (tag 777) on mainnet...
 Payment sent and validated. tx hash=E1F2...
 ```
+
+**Tests:** `tests/test_xrpcli.py::CmdPayTests` covers `pay` end to end without
+ever touching the real network or moving funds — the request store and the
+`xrpl-py` `Wallet`/`submit_and_wait`/`JsonRpcClient` calls are all mocked.
+It checks that: an unknown request ID is rejected; an already-`paid`
+request is rejected (and the error includes its existing tx hash); paying
+without `XRPL_SECRET` set is rejected before any signing is attempted; a
+successful submission marks the request `paid`, records the tx hash and
+payer address, and persists the store; and a non-`tesSUCCESS` result (e.g.
+`tecUNFUNDED_PAYMENT`) raises an error and leaves the request `pending`
+without saving.
