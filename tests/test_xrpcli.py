@@ -180,6 +180,42 @@ class CmdPriceTests(unittest.TestCase):
 
         self.assertIn("no price data for currency", str(ctx.exception))
 
+    @patch("xrpcli.fetch_price")
+    def test_uppercases_mixed_case_currency_input(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {"usd": 1.001}}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_price(make_price_args(currency="UsD"))
+
+        mock_fetch_price.assert_called_once_with("usd")
+        self.assertIn("1 XRP = 1.001 USD", buf.getvalue())
+
+    def test_uppercases_various_currency_codes(self):
+        for currency, price in [("jpy", 150), ("gbp", 0.79), ("btc", 0.0000123)]:
+            with self.subTest(currency=currency):
+                with patch("xrpcli.fetch_price") as mock_fetch_price:
+                    mock_fetch_price.return_value = {"ripple": {currency: price}}
+
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        xrpcli.cmd_price(make_price_args(currency=currency))
+
+                    self.assertIn(
+                        f"1 XRP = {price} {currency.upper()}", buf.getvalue()
+                    )
+
+    @patch("xrpcli.fetch_price")
+    def test_formats_integer_price_without_decimal_artifacts(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {"jpy": 150}}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_price(make_price_args(currency="jpy"))
+
+        self.assertIn("1 XRP = 150 JPY", buf.getvalue())
+        self.assertNotIn("150.0", buf.getvalue())
+
 
 class XrpToDropsTests(unittest.TestCase):
     def test_converts_whole_and_fractional_amounts(self):
