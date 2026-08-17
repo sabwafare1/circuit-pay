@@ -70,14 +70,16 @@ $ python xrpcli.py price --currency eur
 
 ### request
 
-Create a payment request for an exact amount plus a note. Generates a
-shareable `ripple:` payment URI (paste it into a wallet, or turn it into a
-QR code) and an unsigned `Payment` transaction template that a customer's
-wallet or tool can use to send that exact payment. This runs entirely
-offline — no network call is made.
+Create a payment request for an exact amount plus a note. Prints a request
+ID, a shareable `ripple:` payment URI (paste it into a wallet, or turn it
+into a QR code), and an unsigned `Payment` transaction template that a
+customer's wallet or tool can use to send that exact payment. The request
+is also saved locally (see `pay` below) so it can be looked up and settled
+by its ID. Creating the request itself runs entirely offline — no network
+call is made.
 
 ```
-python xrpcli.py request <address> <amount> [--note TEXT] [--tag N]
+python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network mainnet|testnet|devnet]
 ```
 
 - `address` — the merchant's XRPL wallet address to receive the payment
@@ -86,18 +88,22 @@ python xrpcli.py request <address> <amount> [--note TEXT] [--tag N]
 - `--tag` — XRPL destination tag to identify this request (a random one is
   generated if omitted); useful for telling apart multiple incoming payments
   to the same address
+- `--network` — which XRPL network the request should be paid on (default: `mainnet`)
 
 Example:
 
 ```
 $ python xrpcli.py request rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh 12.5 --note "Invoice #42" --tag 777
 Payment request created:
+  Request ID:       9cc8e589
   Pay to:           rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
   Amount:           12.5 XRP (12500000 drops)
   Destination tag:  777
   Note:             Invoice #42
 
-Give this to the customer (paste into a wallet, or turn into a QR code):
+The customer can pay it directly with: xrpcli.py pay 9cc8e589
+
+Or give them this to pay manually (paste into a wallet, or turn into a QR code):
   ripple:rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh?amount=12.5&dt=777&memo=Invoice+%2342
 
 Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):
@@ -115,4 +121,33 @@ Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):
     }
   ]
 }
+```
+
+### pay
+
+Settle an existing payment request by its ID: looks it up, then signs and
+submits the exact `Payment` transaction (amount, destination, destination
+tag, note) to the XRPL network on your behalf. This one **moves real
+funds** and requires the `xrpl-py` package (`pip install -r
+requirements.txt`).
+
+```
+python xrpcli.py pay <request-id>
+```
+
+- `request-id` — the ID printed by `xrpcli.py request`
+
+The payer's wallet secret (seed) must be set in the `XRPL_SECRET`
+environment variable — never pass it as a command-line argument, since
+that would leak into your shell history and process list. On success, the
+request is marked `paid` in the local request store with the resulting
+transaction hash, and paying it again is rejected.
+
+Example:
+
+```
+$ export XRPL_SECRET=sEdT...           # your wallet's seed, kept out of shell history
+$ python xrpcli.py pay 9cc8e589
+Sending 12.5 XRP from rPayerAddress... to rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh (tag 777) on mainnet...
+Payment sent and validated. tx hash=E1F2...
 ```
