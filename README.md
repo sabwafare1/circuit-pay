@@ -124,6 +124,18 @@ python xrpcli.py convert <amount> <xrp|usd>
 - `unit` — the unit of `amount`: `xrp` or `usd` (case-insensitive);
   converts to the other unit
 
+**Error handling:** `unit` and `amount` are both validated locally before
+`fetch_price` is ever called, so a bad argument never wastes a network
+call:
+
+- **Invalid unit** — `error: unit must be 'xrp' or 'usd', got '<unit>'`
+- **Invalid amount** — `error: '<amount>' is not a valid amount` for
+  non-numeric input, or `error: amount must be greater than zero` for
+  zero/negative amounts
+- **Unreachable API / no rate available** — the same `fetch_price` errors
+  as `price` (`error: failed to reach price API: <reason>`), plus `error:
+  no price data available for usd` if the API responds without a USD rate
+
 **Tests:** `tests/test_xrpcli.py::CmdConvertTests` mocks `fetch_price` so
 no test hits the real API. It checks that: converting XRP to USD and USD
 to XRP both produce the expected amount and print the rate used; `unit` is
