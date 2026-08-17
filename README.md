@@ -118,11 +118,13 @@ currency raises a clear error; several currency codes (`jpy`, `gbp`, `btc`)
 uppercase correctly in the output; and an integer price (e.g. `150` for
 `jpy`) prints without a spurious `.0`.
 
-Example:
+Live example (run for real against CoinGecko's API — the exact number
+will differ whenever you run it, since the price moves continuously; this
+was the rate at the moment of capture):
 
 ```
 $ python xrpcli.py price --currency eur
-1 XRP = 0.864225 EUR
+1 XRP = 0.864481 EUR
 ```
 
 ### convert
