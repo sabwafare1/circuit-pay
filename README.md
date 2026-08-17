@@ -35,13 +35,16 @@ each transaction's type, hash, and result; an empty transaction list
 prints a "No transactions found" message instead of nothing; and an
 `actNotFound` error surfaces the friendly "account not found" message.
 
-Example:
+Live example (run for real against XRPL mainnet — re-checked and this
+address's history is unchanged since capture):
 
 ```
 $ python xrpcli.py history rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh --limit 5
 2026-08-16 04:42:10 UTC  EscrowCancel hash=B12968E13A68110199A98D0CC16AFD05DB433BAC842438141A6E0A3773BD056B  result=tesSUCCESS
 2026-08-16 04:41:12 UTC  EscrowCreate hash=28BA6E4FB986AC43BD697BB2B45BAAF56DEED73206BD35B02F30BE4311014F1B  result=tesSUCCESS
-...
+2026-08-14 06:46:01 UTC  EscrowCancel hash=27F1A9FBB23E4D21860DAEBC788D46C0912D046E1BCDCED13E1C389363102EC4  result=tesSUCCESS
+2026-08-14 06:44:41 UTC  EscrowCreate hash=22EC57C0E483EF4B3A173B2859956A323DF801F87B3C2D51037BD6746EC9B7E0  result=tesSUCCESS
+2026-08-11 19:05:21 UTC  Payment      hash=AB9D77240EE7414006F979CD8AF43BEAF9EC510F0E99DBFE7A2156BFB7DB56B6  result=tesSUCCESS
 ```
 
 ### balance
