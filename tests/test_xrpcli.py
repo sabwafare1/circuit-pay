@@ -121,6 +121,32 @@ class CmdHistoryTests(unittest.TestCase):
 
         self.assertIn("account not found", str(ctx.exception))
 
+    @patch("xrpcli.rpc_call")
+    def test_surfaces_error_message_for_unmapped_rpc_error(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "error",
+                "error": "someUnmappedCode",
+                "error_message": "Something specific went wrong.",
+            }
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_history(make_args())
+
+        self.assertIn("Something specific went wrong.", str(ctx.exception))
+
+    @patch("xrpcli.rpc_call")
+    def test_surfaces_raw_error_code_when_no_message_available(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {"status": "error", "error": "someUnmappedCode"}
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_history(make_args())
+
+        self.assertIn("someUnmappedCode", str(ctx.exception))
+
 
 class CmdBalanceTests(unittest.TestCase):
     @patch("xrpcli.rpc_call")
