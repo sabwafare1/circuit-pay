@@ -43,6 +43,19 @@ python xrpcli.py balance <address> [--network mainnet|testnet|devnet]
 - `address` — the XRPL wallet address to check
 - `--network` — which XRPL network to query (default: `mainnet`)
 
+**Error handling:** the address is validated locally before any network
+call is made, so a malformed address never wastes a round trip:
+
+- **Invalid address** — `error: '<address>' is not a valid XRPL wallet
+  address`
+- **Unreachable network** — `error: failed to reach <endpoint>: <reason>`
+  if the XRPL node can't be reached at all
+- **Account not found** — `error: account not found on this network (it
+  may not exist or has never been funded)` for an address that's
+  well-formed but has no ledger entry (XRPL's `actNotFound`)
+- **Other RPC errors** — any other `account_info` error is passed through
+  as `error: <message>`
+
 **Tests:** `tests/test_xrpcli.py::CmdBalanceTests` mocks the RPC call so no
 test hits the real network. It checks that: an invalid address is rejected
 without ever calling `rpc_call`; a successful `account_info` response
