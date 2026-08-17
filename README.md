@@ -83,6 +83,36 @@ $ python xrpcli.py price --currency eur
 1 XRP = 0.864225 EUR
 ```
 
+### convert
+
+Convert an amount between XRP and USD, using the live rate from
+CoinGecko's public price API.
+
+```
+python xrpcli.py convert <amount> <xrp|usd>
+```
+
+- `amount` — the amount to convert (must be a positive number)
+- `unit` — the unit of `amount`: `xrp` or `usd` (case-insensitive);
+  converts to the other unit
+
+**Tests:** `tests/test_xrpcli.py::CmdConvertTests` mocks `fetch_price` so
+no test hits the real API. It checks that: converting XRP to USD and USD
+to XRP both produce the expected amount and print the rate used; `unit` is
+case-insensitive (`XRP` works the same as `xrp`); an invalid unit, a
+non-numeric amount, and a zero/negative amount are all rejected before
+`fetch_price` is ever called; and a response with no USD price available
+raises a clear error.
+
+Example:
+
+```
+$ python xrpcli.py convert 100 xrp
+100 XRP = 100.10 USD (rate: 1 XRP = 1.001 USD)
+$ python xrpcli.py convert 50 usd
+50 USD = 49.950050 XRP (rate: 1 XRP = 1.001 USD)
+```
+
 ### request
 
 Create a payment request for an exact amount plus a note. Prints a request
