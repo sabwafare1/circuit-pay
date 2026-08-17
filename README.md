@@ -43,6 +43,23 @@ $ python xrpcli.py balance rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
 rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh: 56774.125592 XRP (56774125592 drops) on mainnet
 ```
 
+### price
+
+Check the current XRP price, pulled live from CoinGecko's public price API.
+
+```
+python xrpcli.py price [--currency usd]
+```
+
+- `--currency` — fiat currency to price XRP in (default: `usd`)
+
+Example:
+
+```
+$ python xrpcli.py price --currency eur
+1 XRP = 0.864225 EUR
+```
+
 ### request
 
 Create a payment request for an exact amount plus a note. Generates a
