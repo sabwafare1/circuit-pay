@@ -160,7 +160,8 @@ non-numeric amount, and a zero/negative amount are all rejected before
 `fetch_price` is ever called; and a response with no USD price available
 raises a clear error.
 
-Example:
+Live example (run for real against CoinGecko's API — re-checked and the
+rate is unchanged since capture, though it can move on future runs):
 
 ```
 $ python xrpcli.py convert 100 xrp
