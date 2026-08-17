@@ -80,6 +80,14 @@ python xrpcli.py price [--currency usd]
 
 - `--currency` — fiat currency to price XRP in (default: `usd`)
 
+**Error handling:**
+
+- **Unreachable API** — `error: failed to reach price API: <reason>` if
+  CoinGecko can't be reached at all
+- **Unrecognized currency** — `error: no price data for currency
+  '<currency>'` if the API responds but has no price for that currency
+  code (e.g. a typo, or a currency CoinGecko doesn't track)
+
 **Currency formatting:** `--currency` is case-insensitive — it's lowercased
 before being sent to the API and uppercased in the printed output (`eur`,
 `EUR`, and `EuR` all print `... EUR`). The price itself is printed exactly
