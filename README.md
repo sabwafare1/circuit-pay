@@ -205,13 +205,27 @@ that would leak into your shell history and process list. On success, the
 request is marked `paid` in the local request store with the resulting
 transaction hash, and paying it again is rejected.
 
-Example:
+Live example (run against XRPL testnet with two throwaway faucet-funded
+wallets — no real funds involved, and the transaction really landed
+on-ledger with `tesSUCCESS`):
 
 ```
-$ export XRPL_SECRET=sEdT...           # your wallet's seed, kept out of shell history
-$ python xrpcli.py pay 9cc8e589
-Sending 12.5 XRP from rPayerAddress... to rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh (tag 777) on mainnet...
-Payment sent and validated. tx hash=E1F2...
+$ python xrpcli.py request r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD 5 --note "Invoice #42" --network testnet
+Payment request created:
+  Request ID:       c2e32f2d
+  Pay to:           r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD
+  Amount:           5 XRP (5000000 drops)
+  Destination tag:  404363365
+  Note:             Invoice #42
+...
+
+$ export XRPL_SECRET=sEdVCt7SStTpySutToQw73kPZgDMguA   # a throwaway testnet wallet's seed
+$ python xrpcli.py pay c2e32f2d
+Sending 5 XRP from rBFnFXTjvVwp4ar9bYpy9ojcYLgP7bcsha to r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD (tag 404363365) on testnet...
+Payment sent and validated. tx hash=B3737CEDEC9839126D98638E1478330AD9347E38A54ED184DDBC52A84A03435F
+
+$ python xrpcli.py history r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD --network testnet --limit 1
+2026-08-17 04:04:10 UTC  Payment      hash=B3737CEDEC9839126D98638E1478330AD9347E38A54ED184DDBC52A84A03435F  result=tesSUCCESS
 ```
 
 **Tests:** `tests/test_xrpcli.py::CmdPayTests` covers `pay` end to end without
