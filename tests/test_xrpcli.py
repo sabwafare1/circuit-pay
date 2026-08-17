@@ -21,6 +21,10 @@ def make_request_args(address=VALID_ADDRESS, amount="10", note=None, tag=None):
     return argparse.Namespace(address=address, amount=amount, note=note, tag=tag)
 
 
+def make_balance_args(address=VALID_ADDRESS, network="mainnet"):
+    return argparse.Namespace(address=address, network=network)
+
+
 class IsValidClassicAddressTests(unittest.TestCase):
     def test_accepts_valid_address(self):
         self.assertTrue(xrpcli.is_valid_classic_address(VALID_ADDRESS))
@@ -97,6 +101,46 @@ class CmdHistoryTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit) as ctx:
             xrpcli.cmd_history(make_args())
+
+        self.assertIn("account not found", str(ctx.exception))
+
+
+class CmdBalanceTests(unittest.TestCase):
+    @patch("xrpcli.rpc_call")
+    def test_rejects_invalid_address_without_network_call(self, mock_rpc_call):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_balance(make_balance_args(address="not-an-address"))
+
+        self.assertIn("not a valid XRPL wallet address", str(ctx.exception))
+        mock_rpc_call.assert_not_called()
+
+    @patch("xrpcli.rpc_call")
+    def test_prints_balance_on_success(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "account_data": {"Balance": "56774125592"},
+            }
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_balance(make_balance_args())
+
+        output = buf.getvalue()
+        self.assertIn(VALID_ADDRESS, output)
+        self.assertIn("56774.125592 XRP", output)
+        self.assertIn("56774125592 drops", output)
+        self.assertIn("mainnet", output)
+
+    @patch("xrpcli.rpc_call")
+    def test_surfaces_friendly_error_for_account_not_found(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {"status": "error", "error": "actNotFound"}
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_balance(make_balance_args())
 
         self.assertIn("account not found", str(ctx.exception))
 

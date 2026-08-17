@@ -125,6 +125,32 @@ def cmd_history(args):
         )
 
 
+def cmd_balance(args):
+    if not is_valid_classic_address(args.address):
+        raise SystemExit(
+            f"error: '{args.address}' is not a valid XRPL wallet address"
+        )
+
+    endpoint = NETWORKS[args.network]
+    result = rpc_call(
+        endpoint,
+        "account_info",
+        {
+            "account": args.address,
+            "ledger_index": "validated",
+        },
+    )["result"]
+
+    if result.get("status") != "success":
+        code = result.get("error")
+        error = RPC_ERROR_MESSAGES.get(code) or result.get("error_message") or code or "unknown error"
+        raise SystemExit(f"error: {error}")
+
+    drops = int(result["account_data"]["Balance"])
+    xrp = decimal.Decimal(drops) / 1_000_000
+    print(f"{args.address}: {xrp} XRP ({drops} drops) on {args.network}")
+
+
 def cmd_request(args):
     if not is_valid_classic_address(args.address):
         raise SystemExit(
@@ -190,6 +216,18 @@ def build_parser():
         help="maximum number of transactions to show (default: 20)",
     )
     history.set_defaults(func=cmd_history)
+
+    balance = subparsers.add_parser(
+        "balance", help="check the XRP balance of a wallet address"
+    )
+    balance.add_argument("address", help="XRPL wallet address (e.g. rABC...)")
+    balance.add_argument(
+        "--network",
+        choices=NETWORKS.keys(),
+        default="mainnet",
+        help="XRPL network to query (default: mainnet)",
+    )
+    balance.set_defaults(func=cmd_balance)
 
     request = subparsers.add_parser(
         "request", help="create a payment request for a customer to pay"
