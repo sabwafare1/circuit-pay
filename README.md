@@ -15,6 +15,13 @@ python xrpcli.py history <address> [--network mainnet|testnet|devnet] [--limit N
 - `--network` — which XRPL network to query (default: `mainnet`)
 - `--limit` — maximum number of transactions to show (default: `20`)
 
+**Tests:** `tests/test_xrpcli.py::CmdHistoryTests` mocks the RPC call so no
+test hits the real network. It checks that: an invalid address is rejected
+without ever calling `rpc_call`; a successful `account_tx` response prints
+each transaction's type, hash, and result; an empty transaction list
+prints a "No transactions found" message instead of nothing; and an
+`actNotFound` error surfaces the friendly "account not found" message.
+
 Example:
 
 ```
