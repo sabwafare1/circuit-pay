@@ -226,6 +226,17 @@ class RpcCallTests(unittest.TestCase):
         self.assertIn(xrpcli.NETWORKS["mainnet"], str(ctx.exception))
 
 
+class FetchPriceTests(unittest.TestCase):
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_raises_clean_error_when_price_api_unreachable(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("Name or service not known")
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.fetch_price("usd")
+
+        self.assertIn("failed to reach price API", str(ctx.exception))
+
+
 class CmdPriceTests(unittest.TestCase):
     @patch("xrpcli.fetch_price")
     def test_prints_price_on_success(self, mock_fetch_price):
