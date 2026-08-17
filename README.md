@@ -90,6 +90,16 @@ python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network m
   to the same address
 - `--network` — which XRPL network the request should be paid on (default: `mainnet`)
 
+**Tests:** `tests/test_xrpcli.py::CmdRequestTests` mocks `load_requests`/
+`save_requests` so no test ever touches the real `requests.json` on disk.
+It checks that: an invalid address, invalid amount, or out-of-range `--tag`
+is rejected before anything is saved; a successful request prints the
+expected summary/URI/tx JSON and persists an entry with the right address,
+amount, tag, note, and `pending` status; omitting `--note` leaves out the
+memo/URI param and the printed "Note:" line; an omitted `--tag` falls back
+to a (mocked, deterministic) random tag; and a newly generated request ID
+never collides with one already present in the store.
+
 Example:
 
 ```
