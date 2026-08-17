@@ -418,11 +418,50 @@ class CmdRequestTests(unittest.TestCase):
 
         self.assertIn("amount must be greater than zero", str(ctx.exception))
 
+    def test_rejects_negative_amount(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_request(make_request_args(amount="-5"))
+
+        self.assertIn("amount must be greater than zero", str(ctx.exception))
+
+    def test_rejects_non_numeric_amount(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_request(make_request_args(amount="abc"))
+
+        self.assertIn("not a valid XRP amount", str(ctx.exception))
+
+    def test_rejects_amount_with_too_many_decimal_places(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_request(make_request_args(amount="1.1234567"))
+
+        self.assertIn("at most 6 decimal places", str(ctx.exception))
+
     def test_rejects_tag_out_of_range(self):
         with self.assertRaises(SystemExit) as ctx:
             xrpcli.cmd_request(make_request_args(tag=2**32))
 
         self.assertIn("--tag must be between", str(ctx.exception))
+
+    def test_rejects_negative_tag(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_request(make_request_args(tag=-1))
+
+        self.assertIn("--tag must be between", str(ctx.exception))
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_rejected_request_never_touches_the_store(
+        self, mock_load_requests, mock_save_requests
+    ):
+        with self.assertRaises(SystemExit):
+            xrpcli.cmd_request(make_request_args(address="not-an-address"))
+        with self.assertRaises(SystemExit):
+            xrpcli.cmd_request(make_request_args(amount="0"))
+        with self.assertRaises(SystemExit):
+            xrpcli.cmd_request(make_request_args(tag=2**32))
+
+        mock_load_requests.assert_not_called()
+        mock_save_requests.assert_not_called()
 
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests", return_value={})
