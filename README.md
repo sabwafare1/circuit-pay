@@ -36,6 +36,13 @@ python xrpcli.py balance <address> [--network mainnet|testnet|devnet]
 - `address` — the XRPL wallet address to check
 - `--network` — which XRPL network to query (default: `mainnet`)
 
+**Tests:** `tests/test_xrpcli.py::CmdBalanceTests` mocks the RPC call so no
+test hits the real network. It checks that: an invalid address is rejected
+without ever calling `rpc_call`; a successful `account_info` response
+prints the address, the balance in both XRP and drops, and the network
+name; and an `actNotFound` error surfaces the friendly "account not found"
+message.
+
 Example:
 
 ```
