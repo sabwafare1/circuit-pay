@@ -188,6 +188,28 @@ python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network m
   to the same address
 - `--network` — which XRPL network the request should be paid on (default: `mainnet`)
 
+**Request status tracking:** on success, `request` generates a short
+random ID (8 hex characters, e.g. `9cc8e589`) that doesn't collide with
+any ID already in the store, and writes a new entry to `requests.json`
+next to `xrpcli.py` (local only — it's gitignored and never committed):
+
+```json
+{
+  "address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+  "amount": "12.5",
+  "tag": 777,
+  "note": "Invoice #42",
+  "network": "mainnet",
+  "status": "pending",
+  "created_at": "2026-08-16T12:34:56.789012+00:00"
+}
+```
+
+Every request starts life as `"status": "pending"`. From here, `pay
+<request-id>` (see above) is what looks the entry back up, and — only on
+a successful on-ledger payment — flips it to `"paid"` and records the
+transaction hash, payer address, and paid-at timestamp in the same entry.
+
 **Error handling:** all validation happens before anything is written to
 the local request store, so a rejected request never leaves a partial
 entry behind:
