@@ -24,6 +24,25 @@ $ python xrpcli.py history rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh --limit 5
 ...
 ```
 
+### balance
+
+Check the XRP balance of a wallet address, pulled live from the public XRP
+Ledger network.
+
+```
+python xrpcli.py balance <address> [--network mainnet|testnet|devnet]
+```
+
+- `address` — the XRPL wallet address to check
+- `--network` — which XRPL network to query (default: `mainnet`)
+
+Example:
+
+```
+$ python xrpcli.py balance rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
+rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh: 56774.125592 XRP (56774125592 drops) on mainnet
+```
+
 ### request
 
 Create a payment request for an exact amount plus a note. Generates a
