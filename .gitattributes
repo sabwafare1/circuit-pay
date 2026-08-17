@@ -1,0 +1,14 @@
+# Normalize line endings to LF in the repository; Git still checks out
+# text files using the OS-native line ending unless overridden below.
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
