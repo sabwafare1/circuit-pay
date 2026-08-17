@@ -233,18 +233,20 @@ memo/URI param and the printed "Note:" line; an omitted `--tag` falls back
 to a (mocked, deterministic) random tag; and a newly generated request ID
 never collides with one already present in the store.
 
-Example:
+Live example (run for real against the local request store — `request`
+itself makes no network call, but the request ID below is genuinely
+generated, not a placeholder):
 
 ```
 $ python xrpcli.py request rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh 12.5 --note "Invoice #42" --tag 777
 Payment request created:
-  Request ID:       9cc8e589
+  Request ID:       894bc8a7
   Pay to:           rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
   Amount:           12.5 XRP (12500000 drops)
   Destination tag:  777
   Note:             Invoice #42
 
-The customer can pay it directly with: xrpcli.py pay 9cc8e589
+The customer can pay it directly with: xrpcli.py pay 894bc8a7
 
 Or give them this to pay manually (paste into a wallet, or turn into a QR code):
   ripple:rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh?amount=12.5&dt=777&memo=Invoice+%2342
@@ -263,6 +265,19 @@ Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):
       }
     }
   ]
+}
+
+$ cat requests.json
+{
+  "894bc8a7": {
+    "address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+    "amount": "12.5",
+    "tag": 777,
+    "note": "Invoice #42",
+    "network": "mainnet",
+    "status": "pending",
+    "created_at": "2026-08-17T04:27:10.961795+00:00"
+  }
 }
 ```
 
