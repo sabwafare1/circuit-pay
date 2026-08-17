@@ -258,8 +258,25 @@ python xrpcli.py pay <request-id>
 
 - `request-id` — the ID printed by `xrpcli.py request`
 
-On success, the request is marked `paid` in the local request store with
-the resulting transaction hash, and paying it again is rejected.
+**Request status tracking:** every request lives in `requests.json` next
+to `xrpcli.py` (local only — it's gitignored and never committed, since
+it can contain addresses and payment notes). `request` writes a new entry
+with `"status": "pending"`; `pay` reads it, and only on a successful
+`tesSUCCESS` submission updates it in place:
+
+```json
+{
+  "status": "paid",
+  "tx_hash": "B3737CEDEC9839126D98638E1478330AD9347E38A54ED184DDBC52A84A03435F",
+  "paid_by": "rBFnFXTjvVwp4ar9bYpy9ojcYLgP7bcsha",
+  "paid_at": "2026-08-17T04:04:10.462975+00:00"
+}
+```
+
+`status` is the source of truth `pay` checks before doing anything else —
+a `pending` request can be paid, a `paid` one is rejected (see "Already
+paid" below), and a request left `pending` after a failed on-ledger result
+(see "Error handling" below) can simply be retried with `pay` again.
 
 **Environment setup:** `pay` is the only command with extra setup, since
 it's the only one that actually signs and submits a transaction.
