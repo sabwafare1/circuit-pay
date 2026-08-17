@@ -473,10 +473,35 @@ the exact requested amount (in drops), and a `tesSUCCESS` result. A
 payment missing the tag, sent to the wrong address, short/over the exact
 amount, or not yet validated is not treated as a match — matching this
 project's "request an exact amount" philosophy, and avoiding crediting the
-wrong customer's payment to someone else's request on a shared address. On
-a match, the request is updated the same way `pay` updates it (`status`,
-`tx_hash`, `paid_by`, `paid_at`), plus `verified_via: "check"` to record
-how it was confirmed.
+wrong customer's payment to someone else's request on a shared address.
+
+**Request status tracking:** `check` reads and writes the same
+`requests.json` entry that `request` creates and `pay` can also settle
+(see those sections above for the file's location and the full schema).
+On a match it updates the entry the same way a `pay`-driven settlement
+does — `status` flips to `"paid"`, and `tx_hash`/`paid_by`/`paid_at` are
+filled in from the matched transaction — plus one field only `check` ever
+sets:
+
+```json
+{
+  "status": "paid",
+  "tx_hash": "279D6D3424DC83535D6A24A189C67FE488A39B81B73ABC1B26D538E3F8A37F56",
+  "paid_by": "r3cnyVdQRJfvprAni4JnkrM1KsdZseijNT",
+  "paid_at": "2026-08-17T04:47:16.345116+00:00",
+  "verified_via": "check"
+}
+```
+
+`verified_via: "check"` is how you can tell, after the fact, that a
+request was reconciled from a payment made outside this tool (the
+customer's own wallet) rather than settled directly by `xrpcli.py pay` —
+an entry paid via `pay` has no `verified_via` field at all. Because both
+commands write the same `status` field, a request `check` marks paid is
+just as final as one `pay` marks paid: running either command again on it
+short-circuits on the "already paid" case without touching the network,
+and a request left `pending` (no match found yet, or a failed `pay`
+attempt) is safe to check or pay again later.
 
 **Error handling:**
 
