@@ -300,6 +300,25 @@ a `pending` request can be paid, a `paid` one is rejected (see "Already
 paid" below), and a request left `pending` after a failed on-ledger result
 (see "Error handling" below) can simply be retried with `pay` again.
 
+**Tests for status tracking:** three `CmdPayTests` cases in
+`tests/test_xrpcli.py` exercise this lifecycle directly, all without
+touching the real `requests.json` or the network (`load_requests` /
+`save_requests` and the `xrpl-py` calls are mocked):
+
+- `test_submits_payment_and_marks_request_paid_on_success` — after a mocked
+  `submit_and_wait` returns `tesSUCCESS`, asserts the in-memory entry's
+  `status` becomes `"paid"` and `tx_hash`/`paid_by` are set to the values
+  from the response, and that `save_requests` is called exactly once to
+  persist it
+- `test_does_not_mark_paid_when_result_is_not_success` — with a mocked
+  `tecUNFUNDED_PAYMENT` result, asserts the entry's `status` is left
+  unchanged as `"pending"` and `save_requests` is **not** called, so a
+  failed payment never gets recorded as paid
+- `test_rejects_already_paid_request` — seeds the store with an entry
+  whose `status` is already `"paid"`, and asserts `pay` raises before
+  doing anything else, with the error message including the existing
+  `tx_hash`
+
 **Environment setup:** `pay` is the only command with extra setup, since
 it's the only one that actually signs and submits a transaction.
 
