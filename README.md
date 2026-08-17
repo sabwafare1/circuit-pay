@@ -449,3 +449,81 @@ saving; a successful submission marks the request `paid`, records the tx
 hash and payer address, and persists the store; and a non-`tesSUCCESS`
 result (e.g. `tecUNFUNDED_PAYMENT`) raises an error and also leaves the
 request `pending` without saving.
+
+### check
+
+Reconcile a payment request against what's actually happened on the
+ledger, and mark it paid if a matching payment is found. This closes the
+gap `pay` leaves open: most real customers pay by scanning the `ripple:`
+QR code from their own wallet rather than running `xrpcli.py pay`, so
+`request`/`pay` alone never sees that payment — `check` is what looks for
+it after the fact.
+
+```
+python xrpcli.py check <request-id> [--limit N]
+```
+
+- `request-id` — the ID printed by `xrpcli.py request`
+- `--limit` — how many of the merchant's most recent transactions to scan
+  for a match (default: `50`)
+
+It scans the merchant address's transaction history and looks for a
+`Payment` that matches **all** of: destination address, destination tag,
+the exact requested amount (in drops), and a `tesSUCCESS` result. A
+payment missing the tag, sent to the wrong address, short/over the exact
+amount, or not yet validated is not treated as a match — matching this
+project's "request an exact amount" philosophy, and avoiding crediting the
+wrong customer's payment to someone else's request on a shared address. On
+a match, the request is updated the same way `pay` updates it (`status`,
+`tx_hash`, `paid_by`, `paid_at`), plus `verified_via: "check"` to record
+how it was confirmed.
+
+**Error handling:**
+
+- **Unknown request ID** — `error: no payment request found with id
+  '<id>'`
+- **Already paid** — no error; prints that it's already marked paid (with
+  the existing tx hash) and returns without making a network call
+- **Unreachable network / RPC errors** — the same `account_tx` error
+  handling as `history` (unreachable node, `actNotFound`, or any other RPC
+  error passed through)
+- **No match found** — not an error; prints a "No matching payment found
+  yet" message describing what it was looking for, and leaves the request
+  `pending` so it can be checked again later
+
+**Tests:** `tests/test_xrpcli.py::CmdCheckTests` mocks the request store
+and the RPC call, so no test hits the real network. It checks that: an
+unknown request ID is rejected; an already-paid request short-circuits
+before any network call; a matching `Payment` marks the request paid with
+the right `tx_hash`/`paid_by`/`verified_via`; an empty transaction list
+reports no match without saving; and transactions that are the wrong type,
+wrong destination tag, wrong amount, or not `tesSUCCESS` are each
+correctly ignored rather than matched.
+
+Live example (run for real against XRPL testnet with two throwaway
+faucet-funded wallets — the payer wallet paid the request directly with
+`xrpl-py`, entirely independent of `xrpcli.py pay`, simulating a customer
+paying from their own wallet via the QR/URI):
+
+```
+$ python xrpcli.py request rMYdzDjgcwCjsCiUFDAJycpF7Y39ezgp6A 4 --note "Manual pay test" --network testnet
+Payment request created:
+  Request ID:       280aec91
+  Pay to:           rMYdzDjgcwCjsCiUFDAJycpF7Y39ezgp6A
+  Amount:           4 XRP (4000000 drops)
+  Destination tag:  2017085237
+...
+
+$ python xrpcli.py check 280aec91
+No matching payment found yet for request '280aec91' (4 XRP to rMYdzDjgcwCjsCiUFDAJycpF7Y39ezgp6A with tag 2017085237 on testnet).
+
+# ...customer pays 4 XRP to that address/tag directly from their own wallet...
+
+$ python xrpcli.py check 280aec91
+Match found - request '280aec91' is now marked paid.
+  tx hash: 279D6D3424DC83535D6A24A189C67FE488A39B81B73ABC1B26D538E3F8A37F56
+  paid by: r3cnyVdQRJfvprAni4JnkrM1KsdZseijNT
+
+$ python xrpcli.py check 280aec91
+Request '280aec91' is already marked paid (tx hash=279D6D3424DC83535D6A24A189C67FE488A39B81B73ABC1B26D538E3F8A37F56).
+```

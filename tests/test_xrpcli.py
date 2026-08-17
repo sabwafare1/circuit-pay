@@ -31,6 +31,32 @@ def make_pay_args(request_id="abc123"):
     return argparse.Namespace(request_id=request_id)
 
 
+def make_check_args(request_id="abc123", limit=50):
+    return argparse.Namespace(request_id=request_id, limit=limit)
+
+
+def make_account_tx_entry(
+    tx_type="Payment",
+    result="tesSUCCESS",
+    destination=VALID_ADDRESS,
+    destination_tag=42,
+    amount="5000000",
+    account="rPayerAddress",
+    tx_hash="MATCHHASH",
+):
+    return {
+        "tx": {
+            "TransactionType": tx_type,
+            "Destination": destination,
+            "DestinationTag": destination_tag,
+            "Amount": amount,
+            "Account": account,
+            "hash": tx_hash,
+        },
+        "meta": {"TransactionResult": result},
+    }
+
+
 def make_balance_args(address=VALID_ADDRESS, network="mainnet"):
     return argparse.Namespace(address=address, network=network)
 
@@ -736,6 +762,189 @@ class CmdPayTests(unittest.TestCase):
         self.assertIn("tecUNFUNDED_PAYMENT", str(ctx.exception))
         self.assertEqual(entry["status"], "pending")
         mock_save_requests.assert_not_called()
+
+
+class CmdCheckTests(unittest.TestCase):
+    def make_pending_entry(self, **overrides):
+        entry = {
+            "address": VALID_ADDRESS,
+            "amount": "5",
+            "tag": 42,
+            "note": None,
+            "network": "mainnet",
+            "status": "pending",
+        }
+        entry.update(overrides)
+        return entry
+
+    @patch("xrpcli.load_requests", return_value={})
+    def test_rejects_unknown_request_id(self, mock_load_requests):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_check(make_check_args(request_id="doesnotexist"))
+
+        self.assertIn("no payment request found", str(ctx.exception))
+
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_reports_already_paid_without_network_call(
+        self, mock_load_requests, mock_rpc_call
+    ):
+        mock_load_requests.return_value = {
+            "abc123": self.make_pending_entry(status="paid", tx_hash="DEADBEEF")
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_check(make_check_args())
+
+        self.assertIn("already marked paid", buf.getvalue())
+        self.assertIn("DEADBEEF", buf.getvalue())
+        mock_rpc_call.assert_not_called()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_marks_paid_when_matching_payment_found(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry()
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [make_account_tx_entry()],
+            }
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_check(make_check_args())
+
+        output = buf.getvalue()
+        self.assertIn("Match found", output)
+        self.assertIn("MATCHHASH", output)
+        self.assertIn("rPayerAddress", output)
+
+        self.assertEqual(entry["status"], "paid")
+        self.assertEqual(entry["tx_hash"], "MATCHHASH")
+        self.assertEqual(entry["paid_by"], "rPayerAddress")
+        self.assertEqual(entry["verified_via"], "check")
+        mock_save_requests.assert_called_once()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_reports_no_match_when_transactions_list_is_empty(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry()
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {"status": "success", "transactions": []}
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_check(make_check_args())
+
+        self.assertIn("No matching payment found yet", buf.getvalue())
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_ignores_non_payment_transaction_types(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry()
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [make_account_tx_entry(tx_type="EscrowCreate")],
+            }
+        }
+
+        xrpcli.cmd_check(make_check_args())
+
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_ignores_payment_with_wrong_destination_tag(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry()
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [make_account_tx_entry(destination_tag=999)],
+            }
+        }
+
+        xrpcli.cmd_check(make_check_args())
+
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_ignores_payment_with_wrong_amount(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry()
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [make_account_tx_entry(amount="1")],
+            }
+        }
+
+        xrpcli.cmd_check(make_check_args())
+
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_ignores_failed_payment_result(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry()
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [make_account_tx_entry(result="tecPATH_DRY")],
+            }
+        }
+
+        xrpcli.cmd_check(make_check_args())
+
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
+
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_surfaces_friendly_error_for_account_not_found(
+        self, mock_load_requests, mock_rpc_call
+    ):
+        mock_load_requests.return_value = {"abc123": self.make_pending_entry()}
+        mock_rpc_call.return_value = {
+            "result": {"status": "error", "error": "actNotFound"}
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_check(make_check_args())
+
+        self.assertIn("account not found", str(ctx.exception))
 
 
 if __name__ == "__main__":

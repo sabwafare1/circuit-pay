@@ -363,6 +363,73 @@ def cmd_pay(args):
     print(f"Payment sent and validated. tx hash={tx_hash}")
 
 
+def cmd_check(args):
+    requests_store = load_requests()
+    entry = requests_store.get(args.request_id)
+    if entry is None:
+        raise SystemExit(f"error: no payment request found with id '{args.request_id}'")
+
+    if entry["status"] == "paid":
+        print(
+            f"Request '{args.request_id}' is already marked paid "
+            f"(tx hash={entry.get('tx_hash')})."
+        )
+        return
+
+    expected_drops = xrp_to_drops(entry["amount"])
+    network = entry.get("network", "mainnet")
+    endpoint = NETWORKS[network]
+
+    result = rpc_call(
+        endpoint,
+        "account_tx",
+        {
+            "account": entry["address"],
+            "limit": args.limit,
+            "binary": False,
+        },
+    )["result"]
+
+    if result.get("status") != "success":
+        code = result.get("error")
+        error = RPC_ERROR_MESSAGES.get(code) or result.get("error_message") or code or "unknown error"
+        raise SystemExit(f"error: {error}")
+
+    for tx_entry in result.get("transactions", []):
+        tx = tx_entry.get("tx", {})
+        meta = tx_entry.get("meta", {})
+        tx_result = meta.get("TransactionResult") if isinstance(meta, dict) else None
+
+        if tx.get("TransactionType") != "Payment":
+            continue
+        if tx_result != "tesSUCCESS":
+            continue
+        if tx.get("Destination") != entry["address"]:
+            continue
+        if tx.get("DestinationTag") != entry.get("tag"):
+            continue
+        if tx.get("Amount") != str(expected_drops):
+            continue
+
+        entry["status"] = "paid"
+        entry["tx_hash"] = tx.get("hash")
+        entry["paid_by"] = tx.get("Account")
+        entry["paid_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        entry["verified_via"] = "check"
+        save_requests(requests_store)
+
+        print(f"Match found - request '{args.request_id}' is now marked paid.")
+        print(f"  tx hash: {tx.get('hash')}")
+        print(f"  paid by: {tx.get('Account')}")
+        return
+
+    print(
+        f"No matching payment found yet for request '{args.request_id}' "
+        f"({entry['amount']} XRP to {entry['address']} with tag {entry.get('tag')} "
+        f"on {network})."
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="xrpcli", description="XRP Ledger CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -439,6 +506,19 @@ def build_parser():
     )
     pay.add_argument("request_id", help="the request ID printed by 'xrpcli.py request'")
     pay.set_defaults(func=cmd_pay)
+
+    check = subparsers.add_parser(
+        "check",
+        help="check whether a payment request has been paid, and reconcile it if so",
+    )
+    check.add_argument("request_id", help="the request ID printed by 'xrpcli.py request'")
+    check.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="how many recent transactions on the merchant's account to scan (default: 50)",
+    )
+    check.set_defaults(func=cmd_check)
 
     return parser
 
