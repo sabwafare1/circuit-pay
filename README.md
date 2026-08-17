@@ -68,6 +68,14 @@ like `jpy` that price XRP as a whole number print without a decimal point
 (e.g. `150 JPY`), while others print with full precision (e.g. `0.864225
 EUR`).
 
+**Tests:** `tests/test_xrpcli.py::CmdPriceTests` mocks `fetch_price` so no
+test hits the real API. It checks that: a successful lookup prints the
+price and currency; `--currency` is lowercased before being sent to
+`fetch_price` regardless of input case (`EUR`, `UsD`); an unrecognized
+currency raises a clear error; several currency codes (`jpy`, `gbp`, `btc`)
+uppercase correctly in the output; and an integer price (e.g. `150` for
+`jpy`) prints without a spurious `.0`.
+
 Example:
 
 ```
