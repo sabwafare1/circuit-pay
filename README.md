@@ -258,11 +258,44 @@ python xrpcli.py pay <request-id>
 
 - `request-id` — the ID printed by `xrpcli.py request`
 
-The payer's wallet secret (seed) must be set in the `XRPL_SECRET`
-environment variable — never pass it as a command-line argument, since
-that would leak into your shell history and process list. On success, the
-request is marked `paid` in the local request store with the resulting
-transaction hash, and paying it again is rejected.
+On success, the request is marked `paid` in the local request store with
+the resulting transaction hash, and paying it again is rejected.
+
+**Environment setup:** `pay` is the only command with extra setup, since
+it's the only one that actually signs and submits a transaction.
+
+1. Install the `xrpl-py` dependency (the rest of the CLI stays
+   dependency-free and doesn't need this):
+
+   ```
+   pip install -r requirements.txt
+   ```
+
+2. Set the payer's wallet secret (seed) in the `XRPL_SECRET` environment
+   variable. **Never pass it as a command-line argument** — a CLI arg
+   lands in your shell history and is visible to other processes on the
+   machine, while an environment variable set for the current session
+   isn't:
+
+   ```
+   # bash / zsh
+   export XRPL_SECRET=sEdT...
+
+   # PowerShell
+   $env:XRPL_SECRET = "sEdT..."
+
+   # Windows cmd
+   set XRPL_SECRET=sEdT...
+   ```
+
+   Both steps only need to be done once per shell session. Use a
+   throwaway testnet wallet's seed while trying this out, not a mainnet
+   one — `xrpl-py` can generate and fund one for free from the public
+   XRPL testnet faucet:
+
+   ```
+   python -c "from xrpl.clients import JsonRpcClient; from xrpl.wallet import generate_faucet_wallet; w = generate_faucet_wallet(JsonRpcClient('https://s.altnet.rippletest.net:51234')); print(w.seed, w.address)"
+   ```
 
 Live example (run against XRPL testnet with two throwaway faucet-funded
 wallets — no real funds involved, and the transaction really landed
