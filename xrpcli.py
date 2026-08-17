@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import datetime
+import decimal
 import hashlib
 import json
+import secrets
 import urllib.error
+import urllib.parse
 import urllib.request
 
 RIPPLE_EPOCH = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
@@ -40,6 +43,27 @@ def is_valid_classic_address(address):
     payload, checksum = decoded[:-4], decoded[-4:]
     expected = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
     return checksum == expected and payload[0] == 0x00
+
+
+def xrp_to_drops(amount_str):
+    try:
+        amount = decimal.Decimal(amount_str)
+    except decimal.InvalidOperation:
+        raise SystemExit(f"error: '{amount_str}' is not a valid XRP amount")
+    if amount <= 0:
+        raise SystemExit("error: amount must be greater than zero")
+
+    drops = amount * 1_000_000
+    if drops != drops.to_integral_value():
+        raise SystemExit("error: XRP amounts support at most 6 decimal places")
+    return int(drops)
+
+
+def build_payment_uri(address, amount_str, tag, note):
+    params = [("amount", amount_str), ("dt", str(tag))]
+    if note:
+        params.append(("memo", note))
+    return f"ripple:{address}?{urllib.parse.urlencode(params)}"
 
 
 def rpc_call(endpoint, method, params):
@@ -101,6 +125,50 @@ def cmd_history(args):
         )
 
 
+def cmd_request(args):
+    if not is_valid_classic_address(args.address):
+        raise SystemExit(
+            f"error: '{args.address}' is not a valid XRPL wallet address"
+        )
+
+    drops = xrp_to_drops(args.amount)
+
+    if args.tag is not None and not (0 <= args.tag <= 0xFFFFFFFF):
+        raise SystemExit("error: --tag must be between 0 and 4294967295")
+    tag = args.tag if args.tag is not None else secrets.randbelow(0xFFFFFFFF) + 1
+
+    tx_template = {
+        "TransactionType": "Payment",
+        "Destination": args.address,
+        "DestinationTag": tag,
+        "Amount": str(drops),
+    }
+    if args.note:
+        tx_template["Memos"] = [
+            {
+                "Memo": {
+                    "MemoData": args.note.encode("utf-8").hex().upper(),
+                    "MemoFormat": "text/plain".encode("ascii").hex().upper(),
+                }
+            }
+        ]
+
+    uri = build_payment_uri(args.address, args.amount, tag, args.note)
+
+    print("Payment request created:")
+    print(f"  Pay to:           {args.address}")
+    print(f"  Amount:           {args.amount} XRP ({drops} drops)")
+    print(f"  Destination tag:  {tag}")
+    if args.note:
+        print(f"  Note:             {args.note}")
+    print()
+    print("Give this to the customer (paste into a wallet, or turn into a QR code):")
+    print(f"  {uri}")
+    print()
+    print("Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):")
+    print(json.dumps(tx_template, indent=2))
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="xrpcli", description="XRP Ledger CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -122,6 +190,22 @@ def build_parser():
         help="maximum number of transactions to show (default: 20)",
     )
     history.set_defaults(func=cmd_history)
+
+    request = subparsers.add_parser(
+        "request", help="create a payment request for a customer to pay"
+    )
+    request.add_argument("address", help="merchant's XRPL wallet address to receive payment")
+    request.add_argument("amount", help="exact amount to request, in XRP (e.g. 12.5)")
+    request.add_argument(
+        "--note", default=None, help="a short note describing what the payment is for"
+    )
+    request.add_argument(
+        "--tag",
+        type=int,
+        default=None,
+        help="XRPL destination tag to identify this request (random if omitted)",
+    )
+    request.set_defaults(func=cmd_request)
 
     return parser
 
