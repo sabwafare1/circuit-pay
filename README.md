@@ -408,10 +408,17 @@ from there are also surfaced as clean errors rather than raw tracebacks:
 **Tests:** `tests/test_xrpcli.py::CmdPayTests` covers `pay` end to end without
 ever touching the real network or moving funds — the request store and the
 `xrpl-py` `Wallet`/`submit_and_wait`/`JsonRpcClient` calls are all mocked.
-It checks that: an unknown request ID is rejected; an already-`paid`
-request is rejected (and the error includes its existing tx hash); paying
-without `XRPL_SECRET` set is rejected before any signing is attempted; a
-successful submission marks the request `paid`, records the tx hash and
-payer address, and persists the store; and a non-`tesSUCCESS` result (e.g.
-`tecUNFUNDED_PAYMENT`) raises an error and leaves the request `pending`
-without saving.
+It checks every case listed under "Error handling" above, plus the success
+path: an unknown request ID is rejected; an already-`paid` request is
+rejected (and the error includes its existing tx hash); paying without
+`XRPL_SECRET` set is rejected before any signing is attempted; a missing
+`xrpl-py` install is reported clearly (simulated by patching
+`builtins.__import__` to raise `ImportError` for `xrpl` modules, since the
+package is actually installed in the test environment); an invalid secret
+rejected by `Wallet.from_seed` is reported as `invalid XRPL_SECRET`; a
+`submit_and_wait` failure (e.g. an unreachable node) is reported as
+`payment submission failed` and leaves the request `pending` without
+saving; a successful submission marks the request `paid`, records the tx
+hash and payer address, and persists the store; and a non-`tesSUCCESS`
+result (e.g. `tecUNFUNDED_PAYMENT`) raises an error and also leaves the
+request `pending` without saving.
