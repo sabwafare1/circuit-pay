@@ -53,6 +53,14 @@ python xrpcli.py price [--currency usd]
 
 - `--currency` — fiat currency to price XRP in (default: `usd`)
 
+**Currency formatting:** `--currency` is case-insensitive — it's lowercased
+before being sent to the API and uppercased in the printed output (`eur`,
+`EUR`, and `EuR` all print `... EUR`). The price itself is printed exactly
+as returned by the API, with no artificial rounding or padding — currencies
+like `jpy` that price XRP as a whole number print without a decimal point
+(e.g. `150 JPY`), while others print with full precision (e.g. `0.864225
+EUR`).
+
 Example:
 
 ```
