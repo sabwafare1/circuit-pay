@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import datetime
+import hashlib
 import json
 import urllib.error
 import urllib.request
@@ -12,6 +13,33 @@ NETWORKS = {
     "testnet": "https://s.altnet.rippletest.net:51234",
     "devnet": "https://s.devnet.rippletest.net:51234",
 }
+
+# Ripple's base58 alphabet (different ordering than Bitcoin's).
+XRPL_B58_ALPHABET = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz"
+
+RPC_ERROR_MESSAGES = {
+    "actNotFound": "account not found on this network (it may not exist or has never been funded)",
+    "actMalformed": "malformed account address",
+}
+
+
+def is_valid_classic_address(address):
+    if not address or len(address) < 25 or len(address) > 35:
+        return False
+    if any(c not in XRPL_B58_ALPHABET for c in address):
+        return False
+
+    num = 0
+    for char in address:
+        num = num * 58 + XRPL_B58_ALPHABET.index(char)
+    try:
+        decoded = num.to_bytes(25, byteorder="big")
+    except OverflowError:
+        return False
+
+    payload, checksum = decoded[:-4], decoded[-4:]
+    expected = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return checksum == expected and payload[0] == 0x00
 
 
 def rpc_call(endpoint, method, params):
@@ -35,6 +63,11 @@ def format_time(ripple_ts):
 
 
 def cmd_history(args):
+    if not is_valid_classic_address(args.address):
+        raise SystemExit(
+            f"error: '{args.address}' is not a valid XRPL wallet address"
+        )
+
     endpoint = NETWORKS[args.network]
     result = rpc_call(
         endpoint,
@@ -47,7 +80,8 @@ def cmd_history(args):
     )["result"]
 
     if result.get("status") != "success":
-        error = result.get("error_message") or result.get("error") or "unknown error"
+        code = result.get("error")
+        error = RPC_ERROR_MESSAGES.get(code) or result.get("error_message") or code or "unknown error"
         raise SystemExit(f"error: {error}")
 
     transactions = result.get("transactions", [])
