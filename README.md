@@ -76,7 +76,8 @@ prints the address, the balance in both XRP and drops, and the network
 name; and an `actNotFound` error surfaces the friendly "account not found"
 message.
 
-Example:
+Live example (run for real against XRPL mainnet — re-checked and still
+accurate as of this writing):
 
 ```
 $ python xrpcli.py balance rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
