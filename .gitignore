@@ -5,6 +5,9 @@ node_modules/
 __pycache__/
 *.pyc
 
+# Local xrpcli payment request store
+requests.json
+
 # Build output
 dist/
 build/

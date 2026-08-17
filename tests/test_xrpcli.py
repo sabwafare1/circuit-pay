@@ -17,8 +17,16 @@ def make_args(address=VALID_ADDRESS, network="mainnet", limit=20):
     return argparse.Namespace(address=address, network=network, limit=limit)
 
 
-def make_request_args(address=VALID_ADDRESS, amount="10", note=None, tag=None):
-    return argparse.Namespace(address=address, amount=amount, note=note, tag=tag)
+def make_request_args(
+    address=VALID_ADDRESS, amount="10", note=None, tag=None, network="mainnet"
+):
+    return argparse.Namespace(
+        address=address, amount=amount, note=note, tag=tag, network=network
+    )
+
+
+def make_pay_args(request_id="abc123"):
+    return argparse.Namespace(request_id=request_id)
 
 
 def make_balance_args(address=VALID_ADDRESS, network="mainnet"):
@@ -340,7 +348,11 @@ class CmdRequestTests(unittest.TestCase):
 
         self.assertIn("--tag must be between", str(ctx.exception))
 
-    def test_uses_provided_tag_and_prints_request_details(self):
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_uses_provided_tag_and_prints_request_details(
+        self, mock_load_requests, mock_save_requests
+    ):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             xrpcli.cmd_request(
@@ -358,7 +370,21 @@ class CmdRequestTests(unittest.TestCase):
         self.assertIn('"Amount": "12500000"', output)
         self.assertIn('"MemoData"', output)
 
-    def test_omits_memo_and_note_line_when_no_note_given(self):
+        mock_save_requests.assert_called_once()
+        saved = mock_save_requests.call_args[0][0]
+        self.assertEqual(len(saved), 1)
+        entry = next(iter(saved.values()))
+        self.assertEqual(entry["address"], VALID_ADDRESS)
+        self.assertEqual(entry["amount"], "12.5")
+        self.assertEqual(entry["tag"], 777)
+        self.assertEqual(entry["note"], "Invoice #42")
+        self.assertEqual(entry["status"], "pending")
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_omits_memo_and_note_line_when_no_note_given(
+        self, mock_load_requests, mock_save_requests
+    ):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             xrpcli.cmd_request(make_request_args(amount="3", tag=5))
@@ -368,8 +394,12 @@ class CmdRequestTests(unittest.TestCase):
         self.assertNotIn("Memos", output)
         self.assertNotIn("memo=", output)
 
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
     @patch("xrpcli.secrets.randbelow")
-    def test_generates_random_tag_when_not_provided(self, mock_randbelow):
+    def test_generates_random_tag_when_not_provided(
+        self, mock_randbelow, mock_load_requests, mock_save_requests
+    ):
         mock_randbelow.return_value = 41
 
         buf = io.StringIO()
@@ -377,6 +407,136 @@ class CmdRequestTests(unittest.TestCase):
             xrpcli.cmd_request(make_request_args(tag=None))
 
         self.assertIn("Destination tag:  42", buf.getvalue())
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_avoids_id_collision_with_existing_requests(
+        self, mock_load_requests, mock_save_requests
+    ):
+        mock_load_requests.return_value = {"aaaaaaaa": {"status": "pending"}}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_request(make_request_args())
+
+        saved = mock_save_requests.call_args[0][0]
+        self.assertEqual(len(saved), 2)
+        self.assertIn("aaaaaaaa", saved)
+
+
+class CmdPayTests(unittest.TestCase):
+    @patch("xrpcli.load_requests", return_value={})
+    def test_rejects_unknown_request_id(self, mock_load_requests):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args(request_id="doesnotexist"))
+
+        self.assertIn("no payment request found", str(ctx.exception))
+
+    @patch("xrpcli.load_requests")
+    def test_rejects_already_paid_request(self, mock_load_requests):
+        mock_load_requests.return_value = {
+            "abc123": {"status": "paid", "tx_hash": "DEADBEEF"}
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("already paid", str(ctx.exception))
+        self.assertIn("DEADBEEF", str(ctx.exception))
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("xrpcli.load_requests")
+    def test_requires_secret_env_var(self, mock_load_requests):
+        mock_load_requests.return_value = {
+            "abc123": {
+                "status": "pending",
+                "address": VALID_ADDRESS,
+                "amount": "5",
+                "tag": 1,
+                "note": None,
+                "network": "mainnet",
+            }
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("XRPL_SECRET", str(ctx.exception))
+
+    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_submits_payment_and_marks_request_paid_on_success(
+        self, mock_load_requests, mock_save_requests
+    ):
+        entry = {
+            "status": "pending",
+            "address": VALID_ADDRESS,
+            "amount": "5",
+            "tag": 42,
+            "note": "Invoice #42",
+            "network": "mainnet",
+        }
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        mock_response = unittest.mock.Mock()
+        mock_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "TXHASH123",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait", return_value=mock_response
+        ) as mock_submit, patch("xrpl.clients.JsonRpcClient"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("TXHASH123", buf.getvalue())
+        mock_submit.assert_called_once()
+        sent_payment = mock_submit.call_args[0][0]
+        self.assertEqual(sent_payment.destination, VALID_ADDRESS)
+        self.assertEqual(sent_payment.amount, "5000000")
+        self.assertEqual(sent_payment.destination_tag, 42)
+
+        self.assertEqual(entry["status"], "paid")
+        self.assertEqual(entry["tx_hash"], "TXHASH123")
+        self.assertEqual(entry["paid_by"], "rPayerAddress")
+        mock_save_requests.assert_called_once()
+
+    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_does_not_mark_paid_when_result_is_not_success(
+        self, mock_load_requests, mock_save_requests
+    ):
+        entry = {
+            "status": "pending",
+            "address": VALID_ADDRESS,
+            "amount": "5",
+            "tag": 42,
+            "note": None,
+            "network": "mainnet",
+        }
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        mock_response = unittest.mock.Mock()
+        mock_response.result = {
+            "meta": {"TransactionResult": "tecUNFUNDED_PAYMENT"},
+            "hash": "TXHASH123",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait", return_value=mock_response
+        ), patch("xrpl.clients.JsonRpcClient"):
+            with self.assertRaises(SystemExit) as ctx:
+                xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("tecUNFUNDED_PAYMENT", str(ctx.exception))
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
 
 
 if __name__ == "__main__":

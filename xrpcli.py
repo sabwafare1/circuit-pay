@@ -4,6 +4,7 @@ import datetime
 import decimal
 import hashlib
 import json
+import os
 import secrets
 import urllib.error
 import urllib.parse
@@ -18,6 +19,10 @@ NETWORKS = {
 }
 
 PRICE_API_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+REQUESTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.json")
+
+SECRET_ENV_VAR = "XRPL_SECRET"
 
 # Ripple's base58 alphabet (different ordering than Bitcoin's).
 XRPL_B58_ALPHABET = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz"
@@ -66,6 +71,26 @@ def build_payment_uri(address, amount_str, tag, note):
     if note:
         params.append(("memo", note))
     return f"ripple:{address}?{urllib.parse.urlencode(params)}"
+
+
+def load_requests():
+    if not os.path.exists(REQUESTS_FILE):
+        return {}
+    with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_requests(requests_store):
+    with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(requests_store, f, indent=2)
+        f.write("\n")
+
+
+def new_request_id(existing):
+    while True:
+        candidate = secrets.token_hex(4)
+        if candidate not in existing:
+            return candidate
 
 
 def rpc_call(endpoint, method, params):
@@ -228,18 +253,114 @@ def cmd_request(args):
 
     uri = build_payment_uri(args.address, args.amount, tag, args.note)
 
+    requests_store = load_requests()
+    request_id = new_request_id(requests_store)
+    requests_store[request_id] = {
+        "address": args.address,
+        "amount": args.amount,
+        "tag": tag,
+        "note": args.note,
+        "network": args.network,
+        "status": "pending",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    save_requests(requests_store)
+
     print("Payment request created:")
+    print(f"  Request ID:       {request_id}")
     print(f"  Pay to:           {args.address}")
     print(f"  Amount:           {args.amount} XRP ({drops} drops)")
     print(f"  Destination tag:  {tag}")
     if args.note:
         print(f"  Note:             {args.note}")
     print()
-    print("Give this to the customer (paste into a wallet, or turn into a QR code):")
+    print(f"The customer can pay it directly with: xrpcli.py pay {request_id}")
+    print()
+    print("Or give them this to pay manually (paste into a wallet, or turn into a QR code):")
     print(f"  {uri}")
     print()
     print("Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):")
     print(json.dumps(tx_template, indent=2))
+
+
+def cmd_pay(args):
+    requests_store = load_requests()
+    entry = requests_store.get(args.request_id)
+    if entry is None:
+        raise SystemExit(f"error: no payment request found with id '{args.request_id}'")
+    if entry["status"] == "paid":
+        raise SystemExit(
+            f"error: request '{args.request_id}' was already paid "
+            f"(tx hash={entry.get('tx_hash')})"
+        )
+
+    secret = os.environ.get(SECRET_ENV_VAR)
+    if not secret:
+        raise SystemExit(
+            f"error: set the {SECRET_ENV_VAR} environment variable to your wallet's "
+            "secret (seed) before paying"
+        )
+
+    try:
+        from xrpl.clients import JsonRpcClient
+        from xrpl.models.transactions import Memo, Payment
+        from xrpl.transaction import submit_and_wait
+        from xrpl.wallet import Wallet
+    except ImportError:
+        raise SystemExit(
+            "error: the 'xrpl-py' package is required to send payments. "
+            "Install it with: pip install -r requirements.txt"
+        )
+
+    drops = xrp_to_drops(entry["amount"])
+    network = entry.get("network", "mainnet")
+
+    try:
+        wallet = Wallet.from_seed(secret)
+    except Exception as e:
+        raise SystemExit(f"error: invalid {SECRET_ENV_VAR}: {e}")
+
+    memos = None
+    if entry.get("note"):
+        memos = [
+            Memo(
+                memo_data=entry["note"].encode("utf-8").hex().upper(),
+                memo_format="text/plain".encode("ascii").hex().upper(),
+            )
+        ]
+
+    payment = Payment(
+        account=wallet.address,
+        destination=entry["address"],
+        amount=str(drops),
+        destination_tag=entry.get("tag"),
+        memos=memos,
+    )
+
+    print(
+        f"Sending {entry['amount']} XRP from {wallet.address} to {entry['address']} "
+        f"(tag {entry.get('tag')}) on {network}..."
+    )
+
+    client = JsonRpcClient(NETWORKS[network])
+    try:
+        response = submit_and_wait(payment, client, wallet)
+    except Exception as e:
+        raise SystemExit(f"error: payment submission failed: {e}")
+
+    result_code = response.result.get("meta", {}).get("TransactionResult")
+    tx_hash = response.result.get("hash")
+
+    if result_code != "tesSUCCESS":
+        raise SystemExit(f"error: payment failed with result '{result_code}'")
+
+    entry["status"] = "paid"
+    entry["tx_hash"] = tx_hash
+    entry["paid_by"] = wallet.address
+    entry["paid_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    save_requests(requests_store)
+
+    print(f"Payment sent and validated. tx hash={tx_hash}")
 
 
 def build_parser():
@@ -305,7 +426,19 @@ def build_parser():
         default=None,
         help="XRPL destination tag to identify this request (random if omitted)",
     )
+    request.add_argument(
+        "--network",
+        choices=NETWORKS.keys(),
+        default="mainnet",
+        help="XRPL network the request should be paid on (default: mainnet)",
+    )
     request.set_defaults(func=cmd_request)
+
+    pay = subparsers.add_parser(
+        "pay", help="pay an existing payment request by its ID"
+    )
+    pay.add_argument("request_id", help="the request ID printed by 'xrpcli.py request'")
+    pay.set_defaults(func=cmd_pay)
 
     return parser
 
