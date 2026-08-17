@@ -1,4 +1,5 @@
 import argparse
+import builtins
 import contextlib
 import io
 import os
@@ -577,6 +578,89 @@ class CmdPayTests(unittest.TestCase):
             xrpcli.cmd_pay(make_pay_args())
 
         self.assertIn("XRPL_SECRET", str(ctx.exception))
+
+    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    @patch("xrpcli.load_requests")
+    def test_reports_missing_dependency_when_xrpl_py_not_installed(
+        self, mock_load_requests
+    ):
+        mock_load_requests.return_value = {
+            "abc123": {
+                "status": "pending",
+                "address": VALID_ADDRESS,
+                "amount": "5",
+                "tag": 1,
+                "note": None,
+                "network": "mainnet",
+            }
+        }
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "xrpl" or name.startswith("xrpl."):
+                raise ImportError("No module named 'xrpl'")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            with self.assertRaises(SystemExit) as ctx:
+                xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("xrpl-py", str(ctx.exception))
+        self.assertIn("pip install -r requirements.txt", str(ctx.exception))
+
+    @patch.dict(os.environ, {"XRPL_SECRET": "not-a-real-seed"}, clear=True)
+    @patch("xrpcli.load_requests")
+    def test_reports_invalid_secret(self, mock_load_requests):
+        mock_load_requests.return_value = {
+            "abc123": {
+                "status": "pending",
+                "address": VALID_ADDRESS,
+                "amount": "5",
+                "tag": 1,
+                "note": None,
+                "network": "mainnet",
+            }
+        }
+
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", side_effect=ValueError("bad checksum")
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("invalid XRPL_SECRET", str(ctx.exception))
+        self.assertIn("bad checksum", str(ctx.exception))
+
+    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_reports_submission_failure(
+        self, mock_load_requests, mock_save_requests
+    ):
+        entry = {
+            "status": "pending",
+            "address": VALID_ADDRESS,
+            "amount": "5",
+            "tag": 42,
+            "note": None,
+            "network": "mainnet",
+        }
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait",
+            side_effect=Exception("connection refused"),
+        ), patch("xrpl.clients.JsonRpcClient"):
+            with self.assertRaises(SystemExit) as ctx:
+                xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("payment submission failed", str(ctx.exception))
+        self.assertIn("connection refused", str(ctx.exception))
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
 
     @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
     @patch("xrpcli.save_requests")
