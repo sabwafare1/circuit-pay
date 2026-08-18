@@ -139,6 +139,70 @@ Stablecoin balances for rMwNibdiFaEzsTaFCG1NnmAM3Rv3vHUy5L on mainnet:
   RLUSD: 0.00204230364
 ```
 
+#### Setting up a testnet trust line
+
+A fresh wallet has no trust lines at all, so `stablecoins` reports
+`no trust line` for everything until you opt in. This CLI has no
+`trustset` command of its own, so use `xrpl-py` directly — the same way
+the [`pay`](#pay) command's setup steps use it to fund a throwaway
+wallet:
+
+1. Fund a throwaway testnet wallet from the public faucet (same command
+   as the `pay` section above):
+
+   ```
+   python -c "from xrpl.clients import JsonRpcClient; from xrpl.wallet import generate_faucet_wallet; w = generate_faucet_wallet(JsonRpcClient('https://s.altnet.rippletest.net:51234')); print(w.seed, w.address)"
+   ```
+
+2. Submit a `TrustSet` transaction for each stablecoin you want to hold,
+   using that network's issuer address and currency code from
+   `xrpcli.STABLECOINS`:
+
+   ```
+   python -c "
+   from xrpl.clients import JsonRpcClient
+   from xrpl.wallet import Wallet
+   from xrpl.models.transactions import TrustSet
+   from xrpl.models.amounts import IssuedCurrencyAmount
+   from xrpl.transaction import submit_and_wait
+   import xrpcli
+
+   client = JsonRpcClient('https://s.altnet.rippletest.net:51234')
+   wallet = Wallet.from_seed('sEdT...')  # the seed from step 1
+
+   for symbol, info in xrpcli.STABLECOINS.items():
+       tx = TrustSet(
+           account=wallet.address,
+           limit_amount=IssuedCurrencyAmount(
+               currency=info['currency'],
+               issuer=info['issuers']['testnet'],
+               value='1000000',
+           ),
+       )
+       resp = submit_and_wait(tx, client, wallet)
+       print(symbol, '->', resp.result['meta']['TransactionResult'])
+   "
+   ```
+
+3. Check the balances — they'll show `0` rather than `no trust line`,
+   since the trust line now exists but the faucet only funds XRP, not
+   stablecoins:
+
+   ```
+   python xrpcli.py stablecoins <address> --network testnet
+   ```
+
+Live example (run for real against XRPL testnet with a throwaway
+faucet-funded wallet — both `TrustSet` transactions landed on-ledger with
+`tesSUCCESS`, re-checked and still accurate as of this writing):
+
+```
+$ python xrpcli.py stablecoins rhKC5PH4AkqLABbvtjQ48NiTntU8gaCxoq --network testnet
+Stablecoin balances for rhKC5PH4AkqLABbvtjQ48NiTntU8gaCxoq on testnet:
+  USDC: 0
+  RLUSD: 0
+```
+
 ### price
 
 Check the current XRP price, pulled live from CoinGecko's public price API.
