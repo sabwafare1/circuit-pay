@@ -469,14 +469,96 @@ $10 floor; and `test_fee_payment_failure_warns_but_does_not_unmark_the_main_paym
 asserts a failed fee transfer only warns, leaving the already-successful
 main payment marked `paid`.
 
+### Identity verification
+
+A wallet must complete [Veriff](https://www.veriff.com/) identity
+verification before `pay` will send its first payment. `pay` looks up the
+payer's wallet address (derived from `XRPL_SECRET`, not the request) in a
+local store, `verifications.json` next to `xrpcli.py` (local only — it's
+gitignored and never committed):
+
+- **No record for this address (first payment attempt):** `pay` creates a
+  new Veriff verification session via the Veriff Sessions API — passing
+  the wallet address as the session's `vendorData`, which is how the
+  stored verification result is linked back to that address — saves it
+  locally with `"status": "created"`, and **blocks** the payment with an
+  error containing the session URL the user needs to complete:
+
+  ```
+  error: this wallet has not completed identity verification yet. Complete verification, then retry paying: https://alchemy.veriff.com/v/abc123...
+  ```
+- **A record exists but isn't `"approved"` yet:** `pay` polls the Veriff
+  Decision API for that session, updates the stored status, and blocks
+  again unless the decision came back `"approved"`. Before the person has
+  finished (or even started) the session, Veriff's decision endpoint
+  returns `{"status": "success", "verification": null}` — this tool
+  treats that as `"pending"` rather than an error. Once they complete it,
+  the status becomes whatever Veriff's decision reports (e.g.
+  `"approved"`, `"declined"`, `"resubmission_requested"`).
+- **A record exists and is already `"approved"`:** `pay` proceeds
+  immediately — no Veriff API call is made, so an already-verified wallet
+  pays exactly like it did before this feature existed.
+
+```json
+{
+  "rBFnFXTjvVwp4ar9bYpy9ojcYLgP7bcsha": {
+    "session_id": "abc123",
+    "session_url": "https://alchemy.veriff.com/v/abc123",
+    "status": "approved",
+    "created_at": "2026-08-16T12:00:00+00:00",
+    "checked_at": "2026-08-16T12:05:00+00:00"
+  }
+}
+```
+
+**Credentials:** `pay` requires the `VERIFF_API_KEY` and
+`VERIFF_SHARED_SECRET` environment variables (see "Environment setup"
+below) — the same way it requires `XRPL_SECRET` and
+`PLATFORM_FEE_ADDRESS` — and refuses to run without them. Every request
+to the Veriff API is signed with an `X-HMAC-SIGNATURE` header
+(`xrpcli.veriff_signature`): an HMAC-SHA256 hex digest of the request
+body (session creation) or the session ID (decision lookup), keyed with
+`VERIFF_SHARED_SECRET`, alongside the `X-AUTH-CLIENT` header carrying
+`VERIFF_API_KEY`.
+
+**Error handling:** an unreachable Veriff API surfaces as `error: failed
+to reach Veriff API: <reason>`; a response missing the fields this tool
+depends on (`verification.id`/`.url` when creating a session, or a
+`verification` object with no `status` when checking a decision —
+distinct from a `null` `verification`, which means "pending", not
+malformed) surfaces as `error: unexpected response from Veriff
+when ...: <raw response>` rather than a raw traceback.
+
+**Verified against the real Veriff API** (session creation and decision
+polling, sandbox credentials) — not just mocks. That's actually how the
+`null`-verification handling above was found: the first version of this
+code treated it as a malformed response and raised, until a real session
+that hadn't been completed yet returned exactly that shape.
+
+**Tests:** `tests/test_xrpcli.py::VeriffSignatureTests`,
+`CreateVeriffSessionTests`, and `FetchVeriffDecisionTests` cover the
+signing and HTTP calls in isolation (mocking `urllib.request.urlopen`, so
+no test hits the real Veriff API). `EnsurePayerVerifiedTests` covers the
+gating logic directly: an already-`approved` record short-circuits
+without calling either Veriff endpoint; missing credentials are rejected
+before any lookup; a first-time address creates a session and blocks with
+its URL; and a pending record is polled and either proceeds (decision
+comes back `approved`) or blocks again with the new status (e.g.
+`declined`). `CmdPayTests::test_requires_veriff_credentials_env_vars`,
+`test_first_payment_creates_veriff_session_and_blocks`, and
+`test_blocks_while_pending_verification_is_not_yet_approved` cover the
+same gate as `pay` actually exercises it, ahead of any fee calculation or
+transaction submission.
+
 ### pay
 
-Settle an existing payment request by its ID: looks it up, then signs and
-submits the exact `Payment` transaction (amount, destination, destination
-tag, note) to the XRPL network on your behalf, plus the [platform
-fee](#platform-fees) computed from the request's `fee_type`. This one
-**moves real funds** and requires the `xrpl-py` package (`pip install -r
-requirements.txt`).
+Settle an existing payment request by its ID: looks it up, confirms the
+payer's wallet has completed [identity
+verification](#identity-verification), then signs and submits the exact
+`Payment` transaction (amount, destination, destination tag, note) to the
+XRPL network on your behalf, plus the [platform fee](#platform-fees)
+computed from the request's `fee_type`. This one **moves real funds** and
+requires the `xrpl-py` package (`pip install -r requirements.txt`).
 
 ```
 python xrpcli.py pay <request-id>
@@ -571,7 +653,26 @@ it's the only one that actually signs and submits a transaction.
    set PLATFORM_FEE_ADDRESS=rYourFeeWalletAddress...
    ```
 
-   All three steps only need to be done once per shell session. Use a
+4. Set your Veriff API credentials in `VERIFF_API_KEY` and
+   `VERIFF_SHARED_SECRET`. This is also required — `pay` refuses to run
+   without them, since [identity verification](#identity-verification) is
+   mandatory before a wallet's first payment:
+
+   ```
+   # bash / zsh
+   export VERIFF_API_KEY=your-veriff-api-key
+   export VERIFF_SHARED_SECRET=your-veriff-shared-secret
+
+   # PowerShell
+   $env:VERIFF_API_KEY = "your-veriff-api-key"
+   $env:VERIFF_SHARED_SECRET = "your-veriff-shared-secret"
+
+   # Windows cmd
+   set VERIFF_API_KEY=your-veriff-api-key
+   set VERIFF_SHARED_SECRET=your-veriff-shared-secret
+   ```
+
+   All four steps only need to be done once per shell session. Use a
    throwaway testnet wallet's seed while trying this out, not a mainnet
    one — `xrpl-py` can generate and fund one for free from the public
    XRPL testnet faucet:
@@ -596,6 +697,13 @@ Payment request created:
 
 $ export XRPL_SECRET=sEdVCt7SStTpySutToQw73kPZgDMguA   # a throwaway testnet wallet's seed
 $ export PLATFORM_FEE_ADDRESS=rPlatformFeeWalletAAAAAAAAAAAAAAA
+$ export VERIFF_API_KEY=your-veriff-api-key
+$ export VERIFF_SHARED_SECRET=your-veriff-shared-secret
+$ python xrpcli.py pay c2e32f2d
+error: this wallet has not completed identity verification yet. Complete verification, then retry paying: https://alchemy.veriff.com/v/abc123...
+
+# ...customer completes the Veriff flow at that URL, and it comes back approved...
+
 $ python xrpcli.py pay c2e32f2d
 Sending 5 XRP from rBFnFXTjvVwp4ar9bYpy9ojcYLgP7bcsha to r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD (tag 404363365) on testnet...
   Amount:        5 XRP (5000000 drops)
@@ -626,6 +734,19 @@ sign or submit anything:
 6. **Invalid secret** — if `Wallet.from_seed` rejects the value, `error:
    invalid XRPL_SECRET: <underlying reason>`
 
+Once the wallet is known (its address comes from the secret, so this is
+the earliest point it *can* be checked), `pay` gates on [identity
+verification](#identity-verification):
+
+7. **Missing `VERIFF_API_KEY` / `VERIFF_SHARED_SECRET`** — `error: set the
+   VERIFF_API_KEY and VERIFF_SHARED_SECRET environment variables to your
+   Veriff API credentials before paying`
+8. **Wallet not yet verified** — first attempt: `error: this wallet has
+   not completed identity verification yet. Complete verification, then
+   retry paying: <session url>`. Still pending on a later attempt:
+   `error: this wallet's identity verification is not approved yet
+   (status: '<status>'). Complete it at: <session url>`
+
 Only after all of that does it look up the [platform fee](#platform-fees)
 (requiring the CoinGecko price API and the XRPL `fee` RPC method to both
 be reachable — the same `error: failed to reach ...` errors as `price`
@@ -653,11 +774,16 @@ without `PLATFORM_FEE_ADDRESS` set is likewise rejected up front; a missing
 `xrpl-py` install is reported clearly (simulated by patching
 `builtins.__import__` to raise `ImportError` for `xrpl` modules, since the
 package is actually installed in the test environment); an invalid secret
-rejected by `Wallet.from_seed` is reported as `invalid XRPL_SECRET`; a
-`submit_and_wait` failure (e.g. an unreachable node) is reported as
-`payment submission failed` and leaves the request `pending` without
-saving; a successful submission submits both the main payment and the
-platform-fee payment, marks the request `paid`, records the tx hash,
+rejected by `Wallet.from_seed` is reported as `invalid XRPL_SECRET`;
+paying without `VERIFF_API_KEY`/`VERIFF_SHARED_SECRET` set is rejected
+once the wallet is known but before any Veriff call; a wallet with no
+verification record yet has a session created (mocked) and the payment
+blocked with the session URL; a `submit_and_wait` failure (e.g. an
+unreachable node) is reported as `payment submission failed` and leaves
+the request `pending` without saving; a successful submission (for an
+already-`approved` wallet — see [Identity
+verification](#identity-verification)) submits both the main payment and
+the platform-fee payment, marks the request `paid`, records the tx hash,
 payer address, and `platform_fee_tx_hash`, and persists the store; a
 non-`tesSUCCESS` result on the main payment (e.g. `tecUNFUNDED_PAYMENT`)
 raises an error and also leaves the request `pending` without saving; and

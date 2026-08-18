@@ -3,6 +3,7 @@ import argparse
 import datetime
 import decimal
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -22,9 +23,18 @@ PRICE_API_URL = "https://api.coingecko.com/api/v3/simple/price"
 
 REQUESTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.json")
 
+VERIFICATIONS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "verifications.json"
+)
+
 SECRET_ENV_VAR = "XRPL_SECRET"
 
 PLATFORM_FEE_ADDRESS_ENV_VAR = "PLATFORM_FEE_ADDRESS"
+
+VERIFF_API_KEY_ENV_VAR = "VERIFF_API_KEY"
+VERIFF_SHARED_SECRET_ENV_VAR = "VERIFF_SHARED_SECRET"
+VERIFF_BASE_URL = "https://stationapi.veriff.com/v1"
+VERIFF_APPROVED_STATUS = "approved"
 
 FEE_TYPES = ("p2p", "merchant")
 
@@ -156,6 +166,125 @@ def save_requests(requests_store):
     with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
         json.dump(requests_store, f, indent=2)
         f.write("\n")
+
+
+def load_verifications():
+    if not os.path.exists(VERIFICATIONS_FILE):
+        return {}
+    with open(VERIFICATIONS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_verifications(verifications_store):
+    with open(VERIFICATIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(verifications_store, f, indent=2)
+        f.write("\n")
+
+
+def veriff_signature(shared_secret, payload_bytes):
+    return hmac.new(shared_secret.encode("utf-8"), payload_bytes, hashlib.sha256).hexdigest()
+
+
+def create_veriff_session(address, api_key, shared_secret):
+    body = json.dumps({"verification": {"vendorData": address}}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{VERIFF_BASE_URL}/sessions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-AUTH-CLIENT": api_key,
+            "X-HMAC-SIGNATURE": veriff_signature(shared_secret, body),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except urllib.error.URLError as e:
+        raise SystemExit(f"error: failed to reach Veriff API: {e}")
+
+    verification = data.get("verification") or {}
+    session_id = verification.get("id")
+    session_url = verification.get("url")
+    if not session_id or not session_url:
+        raise SystemExit(
+            f"error: unexpected response from Veriff when creating a verification session: {data}"
+        )
+    return session_id, session_url
+
+
+def fetch_veriff_decision(session_id, api_key, shared_secret):
+    req = urllib.request.Request(
+        f"{VERIFF_BASE_URL}/sessions/{session_id}/decision",
+        headers={
+            "X-AUTH-CLIENT": api_key,
+            "X-HMAC-SIGNATURE": veriff_signature(shared_secret, session_id.encode("utf-8")),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except urllib.error.URLError as e:
+        raise SystemExit(f"error: failed to reach Veriff API: {e}")
+
+    if "verification" not in data:
+        raise SystemExit(
+            f"error: unexpected response from Veriff when checking verification status: {data}"
+        )
+
+    verification = data["verification"]
+    if verification is None:
+        # No decision yet -- the person hasn't finished (or started) the
+        # session, which is the normal state right after session creation.
+        return "pending"
+
+    status = verification.get("status")
+    if not status:
+        raise SystemExit(
+            f"error: unexpected response from Veriff when checking verification status: {data}"
+        )
+    return status
+
+
+def ensure_payer_verified(address):
+    api_key = os.environ.get(VERIFF_API_KEY_ENV_VAR)
+    shared_secret = os.environ.get(VERIFF_SHARED_SECRET_ENV_VAR)
+    if not api_key or not shared_secret:
+        raise SystemExit(
+            f"error: set the {VERIFF_API_KEY_ENV_VAR} and {VERIFF_SHARED_SECRET_ENV_VAR} "
+            "environment variables to your Veriff API credentials before paying"
+        )
+
+    verifications_store = load_verifications()
+    record = verifications_store.get(address)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    if record is None:
+        session_id, session_url = create_veriff_session(address, api_key, shared_secret)
+        verifications_store[address] = {
+            "session_id": session_id,
+            "session_url": session_url,
+            "status": "created",
+            "created_at": now,
+            "checked_at": now,
+        }
+        save_verifications(verifications_store)
+        raise SystemExit(
+            "error: this wallet has not completed identity verification yet. "
+            f"Complete verification, then retry paying: {session_url}"
+        )
+
+    if record["status"] != VERIFF_APPROVED_STATUS:
+        status = fetch_veriff_decision(record["session_id"], api_key, shared_secret)
+        record["status"] = status
+        record["checked_at"] = now
+        save_verifications(verifications_store)
+
+        if status != VERIFF_APPROVED_STATUS:
+            raise SystemExit(
+                f"error: this wallet's identity verification is not approved yet "
+                f"(status: '{status}'). Complete it at: {record['session_url']}"
+            )
 
 
 def new_request_id(existing):
@@ -440,6 +569,8 @@ def cmd_pay(args):
         wallet = Wallet.from_seed(secret)
     except Exception as e:  # noqa: BLE001 - xrpl doesn't expose a fixed set of decode errors; any failure here means an invalid secret
         raise SystemExit(f"error: invalid {SECRET_ENV_VAR}: {e}")
+
+    ensure_payer_verified(wallet.address)
 
     drops = xrp_to_drops(entry["amount"])
     network = entry.get("network", "mainnet")

@@ -1,7 +1,10 @@
 import argparse
 import builtins
 import contextlib
+import hashlib
+import hmac
 import io
+import json
 import os
 import sys
 import unittest
@@ -16,7 +19,21 @@ VALID_ADDRESS = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 
 USD_RATE_RESPONSE = {"ripple": {"usd": 1.0}}
 NETWORK_FEE_RESPONSE = {"result": {"status": "success", "drops": {"base_fee": "10"}}}
-PAY_ENV = {"XRPL_SECRET": "sEdTest", "PLATFORM_FEE_ADDRESS": "rFeeCollector"}
+PAY_ENV = {
+    "XRPL_SECRET": "sEdTest",
+    "PLATFORM_FEE_ADDRESS": "rFeeCollector",
+    "VERIFF_API_KEY": "test-api-key",
+    "VERIFF_SHARED_SECRET": "test-shared-secret",
+}
+APPROVED_VERIFICATION_STORE = {
+    "rPayerAddress": {
+        "session_id": "sess-1",
+        "session_url": "https://veriff.example/sessions/sess-1",
+        "status": "approved",
+        "created_at": "2026-08-16T00:00:00+00:00",
+        "checked_at": "2026-08-16T00:00:00+00:00",
+    }
+}
 
 
 def make_args(address=VALID_ADDRESS, network="mainnet", limit=20):
@@ -81,6 +98,20 @@ def make_price_args(currency="usd"):
 
 def make_convert_args(amount="100", unit="xrp"):
     return argparse.Namespace(amount=amount, unit=unit)
+
+
+class FakeJsonResponse:
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
 class IsValidClassicAddressTests(unittest.TestCase):
@@ -571,6 +602,229 @@ class FetchNetworkFeeDropsTests(unittest.TestCase):
         self.assertIn("Fee lookup failed.", str(ctx.exception))
 
 
+class VeriffSignatureTests(unittest.TestCase):
+    def test_matches_hmac_sha256_hex_digest(self):
+        payload = b'{"verification":{"vendorData":"rSomeAddress"}}'
+        expected = hmac.new(b"my-secret", payload, hashlib.sha256).hexdigest()
+        self.assertEqual(xrpcli.veriff_signature("my-secret", payload), expected)
+
+    def test_different_payloads_produce_different_signatures(self):
+        sig_a = xrpcli.veriff_signature("my-secret", b"payload-a")
+        sig_b = xrpcli.veriff_signature("my-secret", b"payload-b")
+        self.assertNotEqual(sig_a, sig_b)
+
+
+class CreateVeriffSessionTests(unittest.TestCase):
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_returns_session_id_and_url_and_signs_the_request(self, mock_urlopen):
+        mock_urlopen.return_value = FakeJsonResponse(
+            {
+                "verification": {
+                    "id": "sess-1",
+                    "url": "https://veriff.example/sessions/sess-1",
+                }
+            }
+        )
+
+        session_id, session_url = xrpcli.create_veriff_session(
+            VALID_ADDRESS, "test-api-key", "test-shared-secret"
+        )
+
+        self.assertEqual(session_id, "sess-1")
+        self.assertEqual(session_url, "https://veriff.example/sessions/sess-1")
+
+        sent_req = mock_urlopen.call_args[0][0]
+        self.assertEqual(sent_req.full_url, f"{xrpcli.VERIFF_BASE_URL}/sessions")
+        self.assertEqual(sent_req.get_header("X-auth-client"), "test-api-key")
+        expected_signature = hmac.new(
+            b"test-shared-secret", sent_req.data, hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(sent_req.get_header("X-hmac-signature"), expected_signature)
+        self.assertEqual(
+            json.loads(sent_req.data), {"verification": {"vendorData": VALID_ADDRESS}}
+        )
+
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_raises_clean_error_when_veriff_unreachable(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("Name or service not known")
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.create_veriff_session(VALID_ADDRESS, "key", "secret")
+
+        self.assertIn("failed to reach Veriff API", str(ctx.exception))
+
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_raises_on_unexpected_response_shape(self, mock_urlopen):
+        mock_urlopen.return_value = FakeJsonResponse({"verification": {}})
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.create_veriff_session(VALID_ADDRESS, "key", "secret")
+
+        self.assertIn("unexpected response from Veriff", str(ctx.exception))
+
+
+class FetchVeriffDecisionTests(unittest.TestCase):
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_returns_status_and_signs_the_request(self, mock_urlopen):
+        mock_urlopen.return_value = FakeJsonResponse(
+            {"verification": {"status": "approved"}}
+        )
+
+        status = xrpcli.fetch_veriff_decision("sess-1", "test-api-key", "test-shared-secret")
+
+        self.assertEqual(status, "approved")
+
+        sent_req = mock_urlopen.call_args[0][0]
+        self.assertEqual(
+            sent_req.full_url, f"{xrpcli.VERIFF_BASE_URL}/sessions/sess-1/decision"
+        )
+        self.assertEqual(sent_req.get_header("X-auth-client"), "test-api-key")
+        expected_signature = hmac.new(
+            b"test-shared-secret", b"sess-1", hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(sent_req.get_header("X-hmac-signature"), expected_signature)
+
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_raises_clean_error_when_veriff_unreachable(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("Name or service not known")
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.fetch_veriff_decision("sess-1", "key", "secret")
+
+        self.assertIn("failed to reach Veriff API", str(ctx.exception))
+
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_raises_on_unexpected_response_shape(self, mock_urlopen):
+        mock_urlopen.return_value = FakeJsonResponse({"verification": {}})
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.fetch_veriff_decision("sess-1", "key", "secret")
+
+        self.assertIn("unexpected response from Veriff", str(ctx.exception))
+
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_null_verification_means_pending_not_an_error(self, mock_urlopen):
+        # Confirmed against the real Veriff API: before the session is
+        # completed, GET .../decision returns {"status": "success",
+        # "verification": null} -- this is the normal "no decision yet"
+        # state, not a malformed response.
+        mock_urlopen.return_value = FakeJsonResponse(
+            {"status": "success", "verification": None}
+        )
+
+        status = xrpcli.fetch_veriff_decision("sess-1", "key", "secret")
+
+        self.assertEqual(status, "pending")
+
+    @patch("xrpcli.urllib.request.urlopen")
+    def test_raises_when_verification_key_missing_entirely(self, mock_urlopen):
+        mock_urlopen.return_value = FakeJsonResponse({"status": "success"})
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.fetch_veriff_decision("sess-1", "key", "secret")
+
+        self.assertIn("unexpected response from Veriff", str(ctx.exception))
+
+
+class EnsurePayerVerifiedTests(unittest.TestCase):
+    @patch.dict(
+        os.environ,
+        {"VERIFF_API_KEY": "test-api-key", "VERIFF_SHARED_SECRET": "test-shared-secret"},
+        clear=True,
+    )
+    @patch("xrpcli.create_veriff_session")
+    @patch("xrpcli.fetch_veriff_decision")
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    def test_returns_silently_when_already_approved(
+        self, mock_load_verifications, mock_fetch_decision, mock_create_session
+    ):
+        xrpcli.ensure_payer_verified("rPayerAddress")
+        mock_fetch_decision.assert_not_called()
+        mock_create_session.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_requires_veriff_credentials(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.ensure_payer_verified("rPayerAddress")
+
+        self.assertIn("VERIFF_API_KEY", str(ctx.exception))
+        self.assertIn("VERIFF_SHARED_SECRET", str(ctx.exception))
+
+    @patch.dict(
+        os.environ,
+        {"VERIFF_API_KEY": "test-api-key", "VERIFF_SHARED_SECRET": "test-shared-secret"},
+        clear=True,
+    )
+    @patch("xrpcli.save_verifications")
+    @patch("xrpcli.load_verifications", return_value={})
+    @patch("xrpcli.create_veriff_session")
+    def test_creates_a_session_on_first_call_and_blocks(
+        self, mock_create_session, mock_load_verifications, mock_save_verifications
+    ):
+        mock_create_session.return_value = ("sess-new", "https://veriff.example/sess-new")
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.ensure_payer_verified("rPayerAddress")
+
+        self.assertIn("https://veriff.example/sess-new", str(ctx.exception))
+        saved = mock_save_verifications.call_args[0][0]
+        self.assertEqual(saved["rPayerAddress"]["status"], "created")
+        self.assertEqual(saved["rPayerAddress"]["session_id"], "sess-new")
+
+    @patch.dict(
+        os.environ,
+        {"VERIFF_API_KEY": "test-api-key", "VERIFF_SHARED_SECRET": "test-shared-secret"},
+        clear=True,
+    )
+    @patch("xrpcli.save_verifications")
+    @patch("xrpcli.load_verifications")
+    @patch("xrpcli.fetch_veriff_decision")
+    def test_polls_and_proceeds_when_pending_becomes_approved(
+        self, mock_fetch_decision, mock_load_verifications, mock_save_verifications
+    ):
+        mock_load_verifications.return_value = {
+            "rPayerAddress": {
+                "session_id": "sess-1",
+                "session_url": "https://veriff.example/sess-1",
+                "status": "created",
+            }
+        }
+        mock_fetch_decision.return_value = "approved"
+
+        xrpcli.ensure_payer_verified("rPayerAddress")  # should not raise
+
+        saved = mock_save_verifications.call_args[0][0]
+        self.assertEqual(saved["rPayerAddress"]["status"], "approved")
+
+    @patch.dict(
+        os.environ,
+        {"VERIFF_API_KEY": "test-api-key", "VERIFF_SHARED_SECRET": "test-shared-secret"},
+        clear=True,
+    )
+    @patch("xrpcli.save_verifications")
+    @patch("xrpcli.load_verifications")
+    @patch("xrpcli.fetch_veriff_decision")
+    def test_polls_and_blocks_when_still_not_approved(
+        self, mock_fetch_decision, mock_load_verifications, mock_save_verifications
+    ):
+        mock_load_verifications.return_value = {
+            "rPayerAddress": {
+                "session_id": "sess-1",
+                "session_url": "https://veriff.example/sess-1",
+                "status": "created",
+            }
+        }
+        mock_fetch_decision.return_value = "declined"
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.ensure_payer_verified("rPayerAddress")
+
+        self.assertIn("not approved yet", str(ctx.exception))
+        self.assertIn("'declined'", str(ctx.exception))
+        saved = mock_save_verifications.call_args[0][0]
+        self.assertEqual(saved["rPayerAddress"]["status"], "declined")
+
+
 class BuildPaymentUriTests(unittest.TestCase):
     def test_includes_address_amount_and_tag(self):
         uri = xrpcli.build_payment_uri(VALID_ADDRESS, "12.5", 777, None)
@@ -861,13 +1115,138 @@ class CmdPayTests(unittest.TestCase):
         self.assertIn("invalid XRPL_SECRET", str(ctx.exception))
         self.assertIn("bad checksum", str(ctx.exception))
 
+    @patch.dict(
+        os.environ,
+        {"XRPL_SECRET": "sEdTest", "PLATFORM_FEE_ADDRESS": "rFeeCollector"},
+        clear=True,
+    )
+    @patch("xrpcli.load_requests")
+    def test_requires_veriff_credentials_env_vars(self, mock_load_requests):
+        mock_load_requests.return_value = {
+            "abc123": {
+                "status": "pending",
+                "address": VALID_ADDRESS,
+                "amount": "5",
+                "tag": 1,
+                "note": None,
+                "network": "mainnet",
+            }
+        }
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", return_value=mock_wallet
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("VERIFF_API_KEY", str(ctx.exception))
+        self.assertIn("VERIFF_SHARED_SECRET", str(ctx.exception))
+
     @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.create_veriff_session")
+    @patch("xrpcli.save_verifications")
+    @patch("xrpcli.load_verifications", return_value={})
+    @patch("xrpcli.load_requests")
+    def test_first_payment_creates_veriff_session_and_blocks(
+        self,
+        mock_load_requests,
+        mock_load_verifications,
+        mock_save_verifications,
+        mock_create_session,
+    ):
+        mock_load_requests.return_value = {
+            "abc123": {
+                "status": "pending",
+                "address": VALID_ADDRESS,
+                "amount": "5",
+                "tag": 1,
+                "note": None,
+                "network": "mainnet",
+            }
+        }
+        mock_create_session.return_value = (
+            "sess-new",
+            "https://veriff.example/sessions/sess-new",
+        )
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", return_value=mock_wallet
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
+
+        mock_create_session.assert_called_once_with(
+            "rPayerAddress", "test-api-key", "test-shared-secret"
+        )
+        self.assertIn("has not completed identity verification", str(ctx.exception))
+        self.assertIn("https://veriff.example/sessions/sess-new", str(ctx.exception))
+
+        saved = mock_save_verifications.call_args[0][0]
+        self.assertEqual(saved["rPayerAddress"]["status"], "created")
+        self.assertEqual(saved["rPayerAddress"]["session_id"], "sess-new")
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.fetch_veriff_decision")
+    @patch("xrpcli.save_verifications")
+    @patch("xrpcli.load_verifications")
+    @patch("xrpcli.load_requests")
+    def test_blocks_while_pending_verification_is_not_yet_approved(
+        self,
+        mock_load_requests,
+        mock_load_verifications,
+        mock_save_verifications,
+        mock_fetch_decision,
+    ):
+        mock_load_requests.return_value = {
+            "abc123": {
+                "status": "pending",
+                "address": VALID_ADDRESS,
+                "amount": "5",
+                "tag": 1,
+                "note": None,
+                "network": "mainnet",
+            }
+        }
+        mock_load_verifications.return_value = {
+            "rPayerAddress": {
+                "session_id": "sess-1",
+                "session_url": "https://veriff.example/sessions/sess-1",
+                "status": "created",
+            }
+        }
+        mock_fetch_decision.return_value = "submitted"
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", return_value=mock_wallet
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
+
+        mock_fetch_decision.assert_called_once_with(
+            "sess-1", "test-api-key", "test-shared-secret"
+        )
+        self.assertIn("not approved yet", str(ctx.exception))
+        self.assertIn("'submitted'", str(ctx.exception))
+
+        saved = mock_save_verifications.call_args[0][0]
+        self.assertEqual(saved["rPayerAddress"]["status"], "submitted")
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
     @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
     @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests")
     def test_reports_submission_failure(
-        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
+        self,
+        mock_load_requests,
+        mock_save_requests,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
     ):
         entry = {
             "status": "pending",
@@ -893,12 +1272,18 @@ class CmdPayTests(unittest.TestCase):
         mock_save_requests.assert_not_called()
 
     @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
     @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
     @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests")
     def test_submits_payment_and_marks_request_paid_on_success(
-        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
+        self,
+        mock_load_requests,
+        mock_save_requests,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
     ):
         entry = {
             "status": "pending",
@@ -958,12 +1343,18 @@ class CmdPayTests(unittest.TestCase):
         mock_save_requests.assert_called_once()
 
     @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
     @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
     @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests")
     def test_merchant_fee_is_clamped_to_the_minimum_when_collected(
-        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
+        self,
+        mock_load_requests,
+        mock_save_requests,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
     ):
         entry = {
             "status": "pending",
@@ -1002,12 +1393,18 @@ class CmdPayTests(unittest.TestCase):
         self.assertEqual(entry["platform_fee_tx_hash"], "FEETXHASH")
 
     @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
     @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
     @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests")
     def test_fee_payment_failure_warns_but_does_not_unmark_the_main_payment(
-        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
+        self,
+        mock_load_requests,
+        mock_save_requests,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
     ):
         entry = {
             "status": "pending",
@@ -1041,12 +1438,18 @@ class CmdPayTests(unittest.TestCase):
         mock_save_requests.assert_called_once()
 
     @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
     @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
     @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests")
     def test_does_not_mark_paid_when_result_is_not_success(
-        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
+        self,
+        mock_load_requests,
+        mock_save_requests,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
     ):
         entry = {
             "status": "pending",

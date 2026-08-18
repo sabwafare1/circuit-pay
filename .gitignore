@@ -8,6 +8,9 @@ __pycache__/
 # Local xrpcli payment request store
 requests.json
 
+# Local xrpcli identity verification store (contains Veriff session data)
+verifications.json
+
 # Build output
 dist/
 build/
