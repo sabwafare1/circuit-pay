@@ -32,6 +32,25 @@ RPC_ERROR_MESSAGES = {
     "actMalformed": "malformed account address",
 }
 
+# Official issuer addresses per network. Currency codes are the 40-char hex
+# encoding required for tickers longer than 3 ASCII characters.
+STABLECOINS = {
+    "USDC": {
+        "currency": "5553444300000000000000000000000000000000",
+        "issuers": {
+            "mainnet": "rGm7WCVp9gb4jZHWTEtGUr4dd74z2XuWhE",
+            "testnet": "rHuGNhqTG32mfmAvWA8hUyWRLV3tCSwKQt",
+        },
+    },
+    "RLUSD": {
+        "currency": "524C555344000000000000000000000000000000",
+        "issuers": {
+            "mainnet": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+            "testnet": "rQhWct2fv4Vc4KRjRgMrxa8xPN9Zx9iLKV",
+        },
+    },
+}
+
 
 def is_valid_classic_address(address):
     if not address or len(address) < 25 or len(address) > 35:
@@ -221,6 +240,53 @@ def cmd_balance(args):
     drops = int(result["account_data"]["Balance"])
     xrp = decimal.Decimal(drops) / 1_000_000
     print(f"{args.address}: {xrp} XRP ({drops} drops) on {args.network}")
+
+
+def cmd_stablecoins(args):
+    if not is_valid_classic_address(args.address):
+        raise SystemExit(
+            f"error: '{args.address}' is not a valid XRPL wallet address"
+        )
+
+    known_issuers = {}
+    for symbol, info in STABLECOINS.items():
+        issuer = info["issuers"].get(args.network)
+        if issuer is not None:
+            known_issuers[(issuer, info["currency"])] = symbol
+    if not known_issuers:
+        raise SystemExit(
+            f"error: no known stablecoin issuers for network '{args.network}'"
+        )
+
+    endpoint = NETWORKS[args.network]
+    result = rpc_call(
+        endpoint,
+        "account_lines",
+        {
+            "account": args.address,
+            "ledger_index": "validated",
+        },
+    )["result"]
+
+    if result.get("status") != "success":
+        code = result.get("error")
+        error = RPC_ERROR_MESSAGES.get(code) or result.get("error_message") or code or "unknown error"
+        raise SystemExit(f"error: {error}")
+
+    balances = {}
+    for line in result.get("lines", []):
+        symbol = known_issuers.get((line.get("account"), line.get("currency")))
+        if symbol is not None:
+            balances[symbol] = line.get("balance", "0")
+
+    print(f"Stablecoin balances for {args.address} on {args.network}:")
+    for symbol, info in STABLECOINS.items():
+        if args.network not in info["issuers"]:
+            continue
+        if symbol in balances:
+            print(f"  {symbol}: {balances[symbol]}")
+        else:
+            print(f"  {symbol}: no trust line")
 
 
 def cmd_request(args):
@@ -463,6 +529,18 @@ def build_parser():
         help="XRPL network to query (default: mainnet)",
     )
     balance.set_defaults(func=cmd_balance)
+
+    stablecoins = subparsers.add_parser(
+        "stablecoins", help="check stablecoin trust line balances (USDC, RLUSD) for a wallet address"
+    )
+    stablecoins.add_argument("address", help="XRPL wallet address (e.g. rABC...)")
+    stablecoins.add_argument(
+        "--network",
+        choices=NETWORKS.keys(),
+        default="mainnet",
+        help="XRPL network to query (default: mainnet)",
+    )
+    stablecoins.set_defaults(func=cmd_stablecoins)
 
     price = subparsers.add_parser("price", help="check the current XRP price")
     price.add_argument(

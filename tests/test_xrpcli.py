@@ -241,6 +241,65 @@ class CmdBalanceTests(unittest.TestCase):
         self.assertIn("someUnmappedCode", str(ctx.exception))
 
 
+class CmdStablecoinsTests(unittest.TestCase):
+    @patch("xrpcli.rpc_call")
+    def test_rejects_invalid_address_without_network_call(self, mock_rpc_call):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_stablecoins(make_balance_args(address="not-an-address"))
+
+        self.assertIn("not a valid XRPL wallet address", str(ctx.exception))
+        mock_rpc_call.assert_not_called()
+
+    @patch("xrpcli.rpc_call")
+    def test_prints_known_balance_and_no_trust_line_for_the_rest(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "lines": [
+                    {
+                        "account": xrpcli.STABLECOINS["RLUSD"]["issuers"]["mainnet"],
+                        "currency": xrpcli.STABLECOINS["RLUSD"]["currency"],
+                        "balance": "12.5",
+                    },
+                    {
+                        "account": "rSomeUnrelatedIssuer",
+                        "currency": "4E4F4E4445580000000000000000000000000000",
+                        "balance": "999",
+                    },
+                ],
+            }
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_stablecoins(make_balance_args())
+
+        output = buf.getvalue()
+        self.assertIn(VALID_ADDRESS, output)
+        self.assertIn("mainnet", output)
+        self.assertIn("RLUSD: 12.5", output)
+        self.assertIn("USDC: no trust line", output)
+
+    @patch("xrpcli.rpc_call")
+    def test_rejects_network_with_no_known_issuers(self, mock_rpc_call):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_stablecoins(make_balance_args(network="devnet"))
+
+        self.assertIn("no known stablecoin issuers", str(ctx.exception))
+        mock_rpc_call.assert_not_called()
+
+    @patch("xrpcli.rpc_call")
+    def test_surfaces_friendly_error_for_account_not_found(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {"status": "error", "error": "actNotFound"}
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_stablecoins(make_balance_args())
+
+        self.assertIn("account not found", str(ctx.exception))
+
+
 class RpcCallTests(unittest.TestCase):
     @patch("xrpcli.urllib.request.urlopen")
     def test_raises_clean_error_when_network_unreachable(self, mock_urlopen):

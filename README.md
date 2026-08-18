@@ -89,6 +89,56 @@ $ python xrpcli.py balance rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
 rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh: 56774.125592 XRP (56774125592 drops) on mainnet
 ```
 
+### stablecoins
+
+Check stablecoin trust line balances (USDC, RLUSD) for a wallet address,
+pulled live from the public XRP Ledger network. Tether (USDT) is not
+included since Tether does not natively issue USDT on the XRP Ledger.
+
+```
+python xrpcli.py stablecoins <address> [--network mainnet|testnet|devnet]
+```
+
+- `address` — the XRPL wallet address to check
+- `--network` — which XRPL network to query (default: `mainnet`). Each
+  stablecoin's issuer address is looked up per network; `devnet` has no
+  known issuers for either token.
+
+**Error handling:** the address is validated locally before any network
+call is made, so a malformed address never wastes a round trip:
+
+- **Invalid address** — `error: '<address>' is not a valid XRPL wallet
+  address`
+- **No known issuers for the network** — `error: no known stablecoin
+  issuers for network '<network>'`
+- **Unreachable network** — `error: failed to reach <endpoint>: <reason>`
+  if the XRPL node can't be reached at all
+- **Account not found** — `error: account not found on this network (it
+  may not exist or has never been funded)` for an address that's
+  well-formed but has no ledger entry (XRPL's `actNotFound`)
+- **Other RPC errors** — any other `account_lines` error is passed
+  through as `error: <message>`
+- A stablecoin the address hasn't trusted shows as `no trust line`
+  rather than `0`, so you can tell "never opted in" apart from "opted in,
+  balance is zero"
+
+**Tests:** `tests/test_xrpcli.py::CmdStablecoinsTests` mocks the RPC call
+so no test hits the real network. It checks that: an invalid address is
+rejected without ever calling `rpc_call`; a matching trust line prints its
+balance while an untrusted stablecoin prints "no trust line"; `devnet` is
+rejected up front since it has no known issuers; and an `actNotFound`
+error surfaces the friendly "account not found" message.
+
+Live example (run for real against XRPL mainnet — re-checked and still
+accurate as of this writing):
+
+```
+$ python xrpcli.py stablecoins rMwNibdiFaEzsTaFCG1NnmAM3Rv3vHUy5L
+Stablecoin balances for rMwNibdiFaEzsTaFCG1NnmAM3Rv3vHUy5L on mainnet:
+  USDC: no trust line
+  RLUSD: 0.00204230364
+```
+
 ### price
 
 Check the current XRP price, pulled live from CoinGecko's public price API.
