@@ -1,5 +1,7 @@
 # circuitpay
 
+[![CI](https://github.com/sabwafare1/circuit-pay/actions/workflows/ci.yml/badge.svg)](https://github.com/sabwafare1/circuit-pay/actions/workflows/ci.yml)
+
 ## xrpcli.py
 
 ### history
