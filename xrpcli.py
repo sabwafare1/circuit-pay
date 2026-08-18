@@ -24,6 +24,17 @@ REQUESTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reques
 
 SECRET_ENV_VAR = "XRPL_SECRET"
 
+PLATFORM_FEE_ADDRESS_ENV_VAR = "PLATFORM_FEE_ADDRESS"
+
+FEE_TYPES = ("p2p", "merchant")
+
+# Platform fee schedule, in USD. Percentage fees are clamped to [min, max]
+# before being converted to XRP at the current market rate.
+P2P_FLAT_FEE_USD = decimal.Decimal("0.10")
+MERCHANT_FEE_RATE = decimal.Decimal("0.005")
+MERCHANT_FEE_MIN_USD = decimal.Decimal("10.00")
+MERCHANT_FEE_MAX_USD = decimal.Decimal("5000.00")
+
 # Ripple's base58 alphabet (different ordering than Bitcoin's).
 XRPL_B58_ALPHABET = "rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz"
 
@@ -83,6 +94,48 @@ def xrp_to_drops(amount_str):
     if drops != drops.to_integral_value():
         raise SystemExit("error: XRP amounts support at most 6 decimal places")
     return int(drops)
+
+
+def drops_to_xrp(drops):
+    return decimal.Decimal(drops) / 1_000_000
+
+
+def usd_to_drops(usd_amount, rate):
+    xrp_amount = usd_amount / rate
+    return int((xrp_amount * 1_000_000).to_integral_value(rounding=decimal.ROUND_HALF_UP))
+
+
+def calculate_platform_fee_usd(amount_usd, fee_type):
+    if fee_type == "merchant":
+        fee = amount_usd * MERCHANT_FEE_RATE
+        fee = max(MERCHANT_FEE_MIN_USD, min(fee, MERCHANT_FEE_MAX_USD))
+    else:
+        fee = P2P_FLAT_FEE_USD
+    return fee.quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
+
+
+def fee_description(fee_type):
+    if fee_type == "merchant":
+        rate_pct = (MERCHANT_FEE_RATE * 100).normalize()
+        return f"{rate_pct}% fee (min ${MERCHANT_FEE_MIN_USD}, max ${MERCHANT_FEE_MAX_USD})"
+    return f"flat ${P2P_FLAT_FEE_USD} fee"
+
+
+def get_usd_rate():
+    data = fetch_price("usd")
+    price = data.get("ripple", {}).get("usd")
+    if price is None:
+        raise SystemExit("error: no price data available for usd")
+    return decimal.Decimal(str(price))
+
+
+def fetch_network_fee_drops(endpoint):
+    result = rpc_call(endpoint, "fee", {})["result"]
+    if result.get("status") != "success":
+        code = result.get("error")
+        error = RPC_ERROR_MESSAGES.get(code) or result.get("error_message") or code or "unknown error"
+        raise SystemExit(f"error: {error}")
+    return int(result["drops"]["base_fee"])
 
 
 def build_payment_uri(address, amount_str, tag, note):
@@ -163,11 +216,7 @@ def cmd_convert(args):
     if amount <= 0:
         raise SystemExit("error: amount must be greater than zero")
 
-    data = fetch_price("usd")
-    price = data.get("ripple", {}).get("usd")
-    if price is None:
-        raise SystemExit("error: no price data available for usd")
-    rate = decimal.Decimal(str(price))
+    rate = get_usd_rate()
 
     if unit == "xrp":
         converted = amount * rate
@@ -327,6 +376,7 @@ def cmd_request(args):
         "tag": tag,
         "note": args.note,
         "network": args.network,
+        "fee_type": args.fee_type,
         "status": "pending",
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
@@ -339,6 +389,7 @@ def cmd_request(args):
     print(f"  Destination tag:  {tag}")
     if args.note:
         print(f"  Note:             {args.note}")
+    print(f"  Fee type:         {args.fee_type} ({fee_description(args.fee_type)})")
     print()
     print(f"The customer can pay it directly with: xrpcli.py pay {request_id}")
     print()
@@ -367,6 +418,13 @@ def cmd_pay(args):
             "secret (seed) before paying"
         )
 
+    fee_address = os.environ.get(PLATFORM_FEE_ADDRESS_ENV_VAR)
+    if not fee_address:
+        raise SystemExit(
+            f"error: set the {PLATFORM_FEE_ADDRESS_ENV_VAR} environment variable to the "
+            "platform's fee-collection wallet address before paying"
+        )
+
     try:
         from xrpl.clients import JsonRpcClient
         from xrpl.models.transactions import Memo, Payment
@@ -378,13 +436,21 @@ def cmd_pay(args):
             "Install it with: pip install -r requirements.txt"
         )
 
-    drops = xrp_to_drops(entry["amount"])
-    network = entry.get("network", "mainnet")
-
     try:
         wallet = Wallet.from_seed(secret)
     except Exception as e:  # noqa: BLE001 - xrpl doesn't expose a fixed set of decode errors; any failure here means an invalid secret
         raise SystemExit(f"error: invalid {SECRET_ENV_VAR}: {e}")
+
+    drops = xrp_to_drops(entry["amount"])
+    network = entry.get("network", "mainnet")
+    endpoint = NETWORKS[network]
+
+    fee_type = entry.get("fee_type", "p2p")
+    rate = get_usd_rate()
+    amount_usd = decimal.Decimal(entry["amount"]) * rate
+    platform_fee_usd = calculate_platform_fee_usd(amount_usd, fee_type)
+    platform_fee_drops = usd_to_drops(platform_fee_usd, rate)
+    network_fee_drops = fetch_network_fee_drops(endpoint)
 
     memos = None
     if entry.get("note"):
@@ -407,8 +473,17 @@ def cmd_pay(args):
         f"Sending {entry['amount']} XRP from {wallet.address} to {entry['address']} "
         f"(tag {entry.get('tag')}) on {network}..."
     )
+    print(f"  Amount:        {entry['amount']} XRP ({drops} drops)")
+    print(
+        f"  Platform fee:  {platform_fee_usd:.2f} USD (~{drops_to_xrp(platform_fee_drops)} XRP) "
+        f"[{fee_type}: {fee_description(fee_type)}]"
+    )
+    print(
+        f"  Network fee:   {drops_to_xrp(network_fee_drops)} XRP ({network_fee_drops} drops), "
+        "paid to the XRPL network"
+    )
 
-    client = JsonRpcClient(NETWORKS[network])
+    client = JsonRpcClient(endpoint)
     try:
         response = submit_and_wait(payment, client, wallet)
     except Exception as e:  # noqa: BLE001 - xrpl-py can raise various network/RPC errors here; any failure means submission didn't succeed
@@ -424,6 +499,29 @@ def cmd_pay(args):
     entry["tx_hash"] = tx_hash
     entry["paid_by"] = wallet.address
     entry["paid_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    entry["platform_fee_usd"] = str(platform_fee_usd)
+    entry["platform_fee_drops"] = platform_fee_drops
+    entry["network_fee_drops"] = network_fee_drops
+
+    # The platform fee is always collected from the sender, as a second
+    # transfer out of the same wallet -- the recipient still receives the
+    # full requested amount from the main payment above.
+    fee_payment = Payment(
+        account=wallet.address,
+        destination=fee_address,
+        amount=str(platform_fee_drops),
+    )
+    try:
+        fee_response = submit_and_wait(fee_payment, client, wallet)
+    except Exception as e:  # noqa: BLE001 - a failed fee transfer shouldn't be mistaken for a failed main payment, which already succeeded
+        print(f"warning: platform fee payment failed to submit: {e}")
+    else:
+        fee_result = fee_response.result.get("meta", {}).get("TransactionResult")
+        if fee_result == "tesSUCCESS":
+            entry["platform_fee_tx_hash"] = fee_response.result.get("hash")
+        else:
+            print(f"warning: platform fee payment did not succeed (result '{fee_result}')")
+
     save_requests(requests_store)
 
     print(f"Payment sent and validated. tx hash={tx_hash}")
@@ -576,6 +674,16 @@ def build_parser():
         choices=NETWORKS.keys(),
         default="mainnet",
         help="XRPL network the request should be paid on (default: mainnet)",
+    )
+    request.add_argument(
+        "--type",
+        dest="fee_type",
+        choices=FEE_TYPES,
+        default="p2p",
+        help=(
+            "transaction type for platform fee purposes: 'p2p' (flat $0.10) or "
+            "'merchant' (0.5 percent, min $10, max $5000) (default: p2p)"
+        ),
     )
     request.set_defaults(func=cmd_request)
 

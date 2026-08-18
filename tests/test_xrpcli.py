@@ -14,16 +14,30 @@ import xrpcli
 
 VALID_ADDRESS = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 
+USD_RATE_RESPONSE = {"ripple": {"usd": 1.0}}
+NETWORK_FEE_RESPONSE = {"result": {"status": "success", "drops": {"base_fee": "10"}}}
+PAY_ENV = {"XRPL_SECRET": "sEdTest", "PLATFORM_FEE_ADDRESS": "rFeeCollector"}
+
 
 def make_args(address=VALID_ADDRESS, network="mainnet", limit=20):
     return argparse.Namespace(address=address, network=network, limit=limit)
 
 
 def make_request_args(
-    address=VALID_ADDRESS, amount="10", note=None, tag=None, network="mainnet"
+    address=VALID_ADDRESS,
+    amount="10",
+    note=None,
+    tag=None,
+    network="mainnet",
+    fee_type="p2p",
 ):
     return argparse.Namespace(
-        address=address, amount=amount, note=note, tag=tag, network=network
+        address=address,
+        amount=amount,
+        note=note,
+        tag=tag,
+        network=network,
+        fee_type=fee_type,
     )
 
 
@@ -478,6 +492,85 @@ class XrpToDropsTests(unittest.TestCase):
             xrpcli.xrp_to_drops("abc")
 
 
+class CalculatePlatformFeeUsdTests(unittest.TestCase):
+    def test_p2p_is_a_flat_dime_regardless_of_amount(self):
+        self.assertEqual(
+            xrpcli.calculate_platform_fee_usd(xrpcli.decimal.Decimal("2"), "p2p"),
+            xrpcli.decimal.Decimal("0.10"),
+        )
+        self.assertEqual(
+            xrpcli.calculate_platform_fee_usd(xrpcli.decimal.Decimal("50000"), "p2p"),
+            xrpcli.decimal.Decimal("0.10"),
+        )
+
+    def test_merchant_charges_half_a_percent_between_the_clamps(self):
+        # 0.5% of $2000 is $10, right at the minimum.
+        self.assertEqual(
+            xrpcli.calculate_platform_fee_usd(xrpcli.decimal.Decimal("2000"), "merchant"),
+            xrpcli.decimal.Decimal("10.00"),
+        )
+        # 0.5% of $4000 is $20, comfortably between the clamps.
+        self.assertEqual(
+            xrpcli.calculate_platform_fee_usd(xrpcli.decimal.Decimal("4000"), "merchant"),
+            xrpcli.decimal.Decimal("20.00"),
+        )
+
+    def test_merchant_fee_is_floored_at_ten_dollars(self):
+        self.assertEqual(
+            xrpcli.calculate_platform_fee_usd(xrpcli.decimal.Decimal("10"), "merchant"),
+            xrpcli.decimal.Decimal("10.00"),
+        )
+
+    def test_merchant_fee_is_capped_at_five_thousand_dollars(self):
+        self.assertEqual(
+            xrpcli.calculate_platform_fee_usd(xrpcli.decimal.Decimal("5000000"), "merchant"),
+            xrpcli.decimal.Decimal("5000.00"),
+        )
+
+
+class UsdToDropsTests(unittest.TestCase):
+    def test_converts_using_the_given_rate(self):
+        # $10 at a rate of 1 XRP = $2 is 5 XRP = 5,000,000 drops.
+        self.assertEqual(
+            xrpcli.usd_to_drops(xrpcli.decimal.Decimal("10"), xrpcli.decimal.Decimal("2")),
+            5000000,
+        )
+
+
+class GetUsdRateTests(unittest.TestCase):
+    @patch("xrpcli.fetch_price")
+    def test_returns_decimal_rate_from_price_response(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {"usd": 1.001}}
+        self.assertEqual(xrpcli.get_usd_rate(), xrpcli.decimal.Decimal("1.001"))
+
+    @patch("xrpcli.fetch_price")
+    def test_raises_when_no_usd_price_available(self, mock_fetch_price):
+        mock_fetch_price.return_value = {"ripple": {}}
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.get_usd_rate()
+        self.assertIn("no price data available", str(ctx.exception))
+
+
+class FetchNetworkFeeDropsTests(unittest.TestCase):
+    @patch("xrpcli.rpc_call")
+    def test_returns_base_fee_in_drops(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {"status": "success", "drops": {"base_fee": "10"}}
+        }
+        self.assertEqual(
+            xrpcli.fetch_network_fee_drops(xrpcli.NETWORKS["mainnet"]), 10
+        )
+
+    @patch("xrpcli.rpc_call")
+    def test_surfaces_rpc_error(self, mock_rpc_call):
+        mock_rpc_call.return_value = {
+            "result": {"status": "error", "error_message": "Fee lookup failed."}
+        }
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.fetch_network_fee_drops(xrpcli.NETWORKS["mainnet"])
+        self.assertIn("Fee lookup failed.", str(ctx.exception))
+
+
 class BuildPaymentUriTests(unittest.TestCase):
     def test_includes_address_amount_and_tag(self):
         uri = xrpcli.build_payment_uri(VALID_ADDRESS, "12.5", 777, None)
@@ -579,6 +672,37 @@ class CmdRequestTests(unittest.TestCase):
         self.assertEqual(entry["tag"], 777)
         self.assertEqual(entry["note"], "Invoice #42")
         self.assertEqual(entry["status"], "pending")
+        self.assertEqual(entry["fee_type"], "p2p")
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_defaults_to_p2p_fee_type_and_prints_flat_fee(
+        self, mock_load_requests, mock_save_requests
+    ):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_request(make_request_args())
+
+        self.assertIn("Fee type:         p2p (flat $0.10 fee)", buf.getvalue())
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_merchant_type_is_stored_and_printed(
+        self, mock_load_requests, mock_save_requests
+    ):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_request(make_request_args(fee_type="merchant"))
+
+        output = buf.getvalue()
+        self.assertIn(
+            "Fee type:         merchant (0.5% fee (min $10.00, max $5000.00))",
+            output,
+        )
+
+        saved = mock_save_requests.call_args[0][0]
+        entry = next(iter(saved.values()))
+        self.assertEqual(entry["fee_type"], "merchant")
 
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests", return_value={})
@@ -665,6 +789,25 @@ class CmdPayTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
     @patch("xrpcli.load_requests")
+    def test_requires_platform_fee_address_env_var(self, mock_load_requests):
+        mock_load_requests.return_value = {
+            "abc123": {
+                "status": "pending",
+                "address": VALID_ADDRESS,
+                "amount": "5",
+                "tag": 1,
+                "note": None,
+                "network": "mainnet",
+            }
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("PLATFORM_FEE_ADDRESS", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_requests")
     def test_reports_missing_dependency_when_xrpl_py_not_installed(
         self, mock_load_requests
     ):
@@ -692,7 +835,11 @@ class CmdPayTests(unittest.TestCase):
         self.assertIn("xrpl-py", str(ctx.exception))
         self.assertIn("pip install -r requirements.txt", str(ctx.exception))
 
-    @patch.dict(os.environ, {"XRPL_SECRET": "not-a-real-seed"}, clear=True)
+    @patch.dict(
+        os.environ,
+        {**PAY_ENV, "XRPL_SECRET": "not-a-real-seed"},
+        clear=True,
+    )
     @patch("xrpcli.load_requests")
     def test_reports_invalid_secret(self, mock_load_requests):
         mock_load_requests.return_value = {
@@ -714,11 +861,13 @@ class CmdPayTests(unittest.TestCase):
         self.assertIn("invalid XRPL_SECRET", str(ctx.exception))
         self.assertIn("bad checksum", str(ctx.exception))
 
-    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests")
     def test_reports_submission_failure(
-        self, mock_load_requests, mock_save_requests
+        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
     ):
         entry = {
             "status": "pending",
@@ -743,11 +892,13 @@ class CmdPayTests(unittest.TestCase):
         self.assertEqual(entry["status"], "pending")
         mock_save_requests.assert_not_called()
 
-    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests")
     def test_submits_payment_and_marks_request_paid_on_success(
-        self, mock_load_requests, mock_save_requests
+        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
     ):
         entry = {
             "status": "pending",
@@ -760,36 +911,142 @@ class CmdPayTests(unittest.TestCase):
         mock_load_requests.return_value = {"abc123": entry}
 
         mock_wallet = unittest.mock.Mock(address="rPayerAddress")
-        mock_response = unittest.mock.Mock()
-        mock_response.result = {
+        main_response = unittest.mock.Mock()
+        main_response.result = {
             "meta": {"TransactionResult": "tesSUCCESS"},
             "hash": "TXHASH123",
         }
+        fee_response = unittest.mock.Mock()
+        fee_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "FEETXHASH",
+        }
 
         with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
-            "xrpl.transaction.submit_and_wait", return_value=mock_response
+            "xrpl.transaction.submit_and_wait",
+            side_effect=[main_response, fee_response],
         ) as mock_submit, patch("xrpl.clients.JsonRpcClient"):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 xrpcli.cmd_pay(make_pay_args())
 
-        self.assertIn("TXHASH123", buf.getvalue())
-        mock_submit.assert_called_once()
-        sent_payment = mock_submit.call_args[0][0]
+        output = buf.getvalue()
+        self.assertIn("TXHASH123", output)
+        self.assertIn("Platform fee:  0.10 USD", output)
+        self.assertIn("[p2p:", output)
+        self.assertIn("Network fee:   0.00001 XRP (10 drops)", output)
+
+        # Two transactions: the main payment (full amount, to the recipient)
+        # and the platform fee (deducted from the sender, to the fee wallet).
+        self.assertEqual(mock_submit.call_count, 2)
+        sent_payment = mock_submit.call_args_list[0][0][0]
         self.assertEqual(sent_payment.destination, VALID_ADDRESS)
         self.assertEqual(sent_payment.amount, "5000000")
         self.assertEqual(sent_payment.destination_tag, 42)
+        fee_payment = mock_submit.call_args_list[1][0][0]
+        self.assertEqual(fee_payment.account, "rPayerAddress")
+        self.assertEqual(fee_payment.destination, "rFeeCollector")
+        self.assertEqual(fee_payment.amount, "100000")
 
         self.assertEqual(entry["status"], "paid")
         self.assertEqual(entry["tx_hash"], "TXHASH123")
         self.assertEqual(entry["paid_by"], "rPayerAddress")
+        self.assertEqual(entry["platform_fee_usd"], "0.10")
+        self.assertEqual(entry["platform_fee_drops"], 100000)
+        self.assertEqual(entry["network_fee_drops"], 10)
+        self.assertEqual(entry["platform_fee_tx_hash"], "FEETXHASH")
         mock_save_requests.assert_called_once()
 
-    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_merchant_fee_is_clamped_to_the_minimum_when_collected(
+        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
+    ):
+        entry = {
+            "status": "pending",
+            "address": VALID_ADDRESS,
+            "amount": "5",
+            "tag": 42,
+            "note": None,
+            "network": "mainnet",
+            "fee_type": "merchant",
+        }
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        main_response = unittest.mock.Mock()
+        main_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "TXHASH123",
+        }
+        fee_response = unittest.mock.Mock()
+        fee_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "FEETXHASH",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait",
+            side_effect=[main_response, fee_response],
+        ) as mock_submit, patch("xrpl.clients.JsonRpcClient"):
+            xrpcli.cmd_pay(make_pay_args())
+
+        self.assertEqual(mock_submit.call_count, 2)
+        fee_payment = mock_submit.call_args_list[1][0][0]
+        self.assertEqual(fee_payment.destination, "rFeeCollector")
+        # 0.5% of 5 XRP ($5 at rate 1.0) is $0.025, clamped up to the $10 merchant minimum.
+        self.assertEqual(fee_payment.amount, "10000000")
+        self.assertEqual(entry["platform_fee_tx_hash"], "FEETXHASH")
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_fee_payment_failure_warns_but_does_not_unmark_the_main_payment(
+        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
+    ):
+        entry = {
+            "status": "pending",
+            "address": VALID_ADDRESS,
+            "amount": "5",
+            "tag": 42,
+            "note": None,
+            "network": "mainnet",
+        }
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        main_response = unittest.mock.Mock()
+        main_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "TXHASH123",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait",
+            side_effect=[main_response, Exception("connection refused")],
+        ), patch("xrpl.clients.JsonRpcClient"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("warning: platform fee payment failed to submit", buf.getvalue())
+        # The main payment already succeeded, so the request still ends up paid.
+        self.assertEqual(entry["status"], "paid")
+        self.assertNotIn("platform_fee_tx_hash", entry)
+        mock_save_requests.assert_called_once()
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests")
     def test_does_not_mark_paid_when_result_is_not_success(
-        self, mock_load_requests, mock_save_requests
+        self, mock_load_requests, mock_save_requests, mock_fetch_price, mock_rpc_call
     ):
         entry = {
             "status": "pending",

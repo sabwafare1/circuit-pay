@@ -300,7 +300,7 @@ by its ID. Creating the request itself runs entirely offline — no network
 call is made.
 
 ```
-python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network mainnet|testnet|devnet]
+python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network mainnet|testnet|devnet] [--type p2p|merchant]
 ```
 
 - `address` — the merchant's XRPL wallet address to receive the payment
@@ -310,6 +310,8 @@ python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network m
   generated if omitted); useful for telling apart multiple incoming payments
   to the same address
 - `--network` — which XRPL network the request should be paid on (default: `mainnet`)
+- `--type` — `p2p` or `merchant` (default: `p2p`); which [platform fee](#platform-fees)
+  applies when this request is paid
 
 **Request status tracking:** on success, `request` generates a short
 random ID (8 hex characters, e.g. `9cc8e589`) that doesn't collide with
@@ -323,6 +325,7 @@ next to `xrpcli.py` (local only — it's gitignored and never committed):
   "tag": 777,
   "note": "Invoice #42",
   "network": "mainnet",
+  "fee_type": "p2p",
   "status": "pending",
   "created_at": "2026-08-16T12:34:56.789012+00:00"
 }
@@ -353,8 +356,10 @@ is rejected before anything is saved; a successful request prints the
 expected summary/URI/tx JSON and persists an entry with the right address,
 amount, tag, note, and `pending` status; omitting `--note` leaves out the
 memo/URI param and the printed "Note:" line; an omitted `--tag` falls back
-to a (mocked, deterministic) random tag; and a newly generated request ID
-never collides with one already present in the store.
+to a (mocked, deterministic) random tag; a newly generated request ID
+never collides with one already present in the store; `--type` defaults to
+`p2p` and prints/persists the flat-fee description; and `--type merchant`
+prints/persists the percentage-fee description instead.
 
 Live example (run for real against the local request store — `request`
 itself makes no network call, but the request ID below is genuinely
@@ -404,12 +409,73 @@ $ cat requests.json
 }
 ```
 
+### Platform fees
+
+Every request carries a `fee_type` — `p2p` or `merchant`, set via
+`request`'s `--type` flag (default `p2p`) — that determines the platform
+fee charged when it's paid:
+
+| Type       | Fee                                                        |
+| ---------- | ------------------------------------------------------------ |
+| `p2p`      | flat $0.10                                                    |
+| `merchant` | 0.5% of the amount, clamped to a $10.00 minimum and $5,000.00 maximum |
+
+Fees are USD-denominated but settled in XRP, so `pay` converts them using
+the live XRP/USD rate from the same CoinGecko API `price`/`convert` use
+(`xrpcli.get_usd_rate`). `pay` prints the requested amount, the platform
+fee, and the current XRPL network fee as three separate line items before
+submitting, e.g.:
+
+```
+Sending 5 XRP from rBFnFXTjvVwp4ar9bYpy9ojcYLgP7bcsha to r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD (tag 404363365) on testnet...
+  Amount:        5 XRP (5000000 drops)
+  Platform fee:  0.10 USD (~0.099950 XRP) [p2p: flat $0.10 fee]
+  Network fee:   0.00001 XRP (10 drops), paid to the XRPL network
+```
+
+The network fee is the small, separate cost the XRPL network itself
+charges to include the transaction in a ledger (fetched live via the
+`fee` RPC method) — it is not part of the platform fee and this tool
+never collects it on the platform's behalf.
+
+**Collection is mandatory, and always comes out of the sender's wallet,
+never the recipient's.** `pay` requires the `PLATFORM_FEE_ADDRESS`
+environment variable (the platform's fee-collection wallet address) the
+same way it requires `XRPL_SECRET` — see "Environment setup" below — and
+refuses to pay anything without it. The recipient always receives the
+exact requested `amount` via the main `Payment`; the platform fee is a
+*second*, separate `Payment` sent from the payer's own wallet to
+`PLATFORM_FEE_ADDRESS` immediately after the main payment succeeds, and
+its hash is recorded on the request entry as `platform_fee_tx_hash`. If
+that second transaction fails, `pay` prints a `warning:` rather than
+raising — the main payment already succeeded and is not rolled back, so
+the request is still marked `paid`; the fee simply needs to be collected
+or retried out of band.
+
+`pay` records `platform_fee_usd`, `platform_fee_drops`, and
+`network_fee_drops` on the request entry once it settles.
+
+**Tests:** `tests/test_xrpcli.py::CalculatePlatformFeeUsdTests`,
+`UsdToDropsTests`, `GetUsdRateTests`, and `FetchNetworkFeeDropsTests`
+cover the fee math and lookups in isolation. `CmdPayTests` covers the
+integration: `test_requires_platform_fee_address_env_var` asserts `pay`
+refuses to run without it; `test_submits_payment_and_marks_request_paid_on_success`
+asserts the printed breakdown, that both the main payment (full amount,
+to the recipient) and the fee payment (to `PLATFORM_FEE_ADDRESS`, from
+the sender) are submitted, and the `platform_fee_*`/`network_fee_drops`
+fields saved on the entry; `test_merchant_fee_is_clamped_to_the_minimum_when_collected`
+asserts the fee payment amount for a merchant-type request below the
+$10 floor; and `test_fee_payment_failure_warns_but_does_not_unmark_the_main_payment`
+asserts a failed fee transfer only warns, leaving the already-successful
+main payment marked `paid`.
+
 ### pay
 
 Settle an existing payment request by its ID: looks it up, then signs and
 submits the exact `Payment` transaction (amount, destination, destination
-tag, note) to the XRPL network on your behalf. This one **moves real
-funds** and requires the `xrpl-py` package (`pip install -r
+tag, note) to the XRPL network on your behalf, plus the [platform
+fee](#platform-fees) computed from the request's `fee_type`. This one
+**moves real funds** and requires the `xrpl-py` package (`pip install -r
 requirements.txt`).
 
 ```
@@ -489,7 +555,23 @@ it's the only one that actually signs and submits a transaction.
    set XRPL_SECRET=sEdT...
    ```
 
-   Both steps only need to be done once per shell session. Use a
+3. Set the platform's fee-collection wallet address in
+   `PLATFORM_FEE_ADDRESS`. This is required — `pay` refuses to run
+   without it, since [platform fee collection](#platform-fees) is
+   mandatory, not optional:
+
+   ```
+   # bash / zsh
+   export PLATFORM_FEE_ADDRESS=rYourFeeWalletAddress...
+
+   # PowerShell
+   $env:PLATFORM_FEE_ADDRESS = "rYourFeeWalletAddress..."
+
+   # Windows cmd
+   set PLATFORM_FEE_ADDRESS=rYourFeeWalletAddress...
+   ```
+
+   All three steps only need to be done once per shell session. Use a
    throwaway testnet wallet's seed while trying this out, not a mainnet
    one — `xrpl-py` can generate and fund one for free from the public
    XRPL testnet faucet:
@@ -513,8 +595,12 @@ Payment request created:
 ...
 
 $ export XRPL_SECRET=sEdVCt7SStTpySutToQw73kPZgDMguA   # a throwaway testnet wallet's seed
+$ export PLATFORM_FEE_ADDRESS=rPlatformFeeWalletAAAAAAAAAAAAAAA
 $ python xrpcli.py pay c2e32f2d
 Sending 5 XRP from rBFnFXTjvVwp4ar9bYpy9ojcYLgP7bcsha to r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD (tag 404363365) on testnet...
+  Amount:        5 XRP (5000000 drops)
+  Platform fee:  0.10 USD (~0.099950 XRP) [p2p: flat $0.10 fee]
+  Network fee:   0.00001 XRP (10 drops), paid to the XRPL network
 Payment sent and validated. tx hash=B3737CEDEC9839126D98638E1478330AD9347E38A54ED184DDBC52A84A03435F
 
 $ python xrpcli.py history r4KQHDm9stpeauF1EK986rYB7cuZPSoRBD --network testnet --limit 1
@@ -529,15 +615,23 @@ sign or submit anything:
    so the same request can never be paid twice
 3. **Missing `XRPL_SECRET`** — `error: set the XRPL_SECRET environment
    variable to your wallet's secret (seed) before paying`
-4. **`xrpl-py` not installed** — `error: the 'xrpl-py' package is required
+4. **Missing `PLATFORM_FEE_ADDRESS`** — `error: set the
+   PLATFORM_FEE_ADDRESS environment variable to the platform's
+   fee-collection wallet address before paying`; [fee collection is
+   mandatory](#platform-fees), so `pay` won't run without it
+5. **`xrpl-py` not installed** — `error: the 'xrpl-py' package is required
    to send payments. Install it with: pip install -r requirements.txt`
    (only this command needs the dependency; the rest of the CLI still
    works without it)
-5. **Invalid secret** — if `Wallet.from_seed` rejects the value, `error:
+6. **Invalid secret** — if `Wallet.from_seed` rejects the value, `error:
    invalid XRPL_SECRET: <underlying reason>`
 
-Only after all of that does it build and submit the transaction. Failures
-from there are also surfaced as clean errors rather than raw tracebacks:
+Only after all of that does it look up the [platform fee](#platform-fees)
+(requiring the CoinGecko price API and the XRPL `fee` RPC method to both
+be reachable — the same `error: failed to reach ...` errors as `price`
+and `history` apply here too) and then build and submit the transaction.
+Failures from there are also surfaced as clean errors rather than raw
+tracebacks:
 
 - **Submission/network failure** (unreachable node, unfunded sender
   account, bad autofill, etc.) — `error: payment submission failed:
@@ -554,17 +648,21 @@ ever touching the real network or moving funds — the request store and the
 It checks every case listed under "Error handling" above, plus the success
 path: an unknown request ID is rejected; an already-`paid` request is
 rejected (and the error includes its existing tx hash); paying without
-`XRPL_SECRET` set is rejected before any signing is attempted; a missing
+`XRPL_SECRET` set is rejected before any signing is attempted; paying
+without `PLATFORM_FEE_ADDRESS` set is likewise rejected up front; a missing
 `xrpl-py` install is reported clearly (simulated by patching
 `builtins.__import__` to raise `ImportError` for `xrpl` modules, since the
 package is actually installed in the test environment); an invalid secret
 rejected by `Wallet.from_seed` is reported as `invalid XRPL_SECRET`; a
 `submit_and_wait` failure (e.g. an unreachable node) is reported as
 `payment submission failed` and leaves the request `pending` without
-saving; a successful submission marks the request `paid`, records the tx
-hash and payer address, and persists the store; and a non-`tesSUCCESS`
-result (e.g. `tecUNFUNDED_PAYMENT`) raises an error and also leaves the
-request `pending` without saving.
+saving; a successful submission submits both the main payment and the
+platform-fee payment, marks the request `paid`, records the tx hash,
+payer address, and `platform_fee_tx_hash`, and persists the store; a
+non-`tesSUCCESS` result on the main payment (e.g. `tecUNFUNDED_PAYMENT`)
+raises an error and also leaves the request `pending` without saving; and
+a fee payment that fails to submit only prints a `warning:` — the main
+payment already succeeded, so the request is still marked `paid`.
 
 ### check
 
