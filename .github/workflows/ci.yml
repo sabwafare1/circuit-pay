@@ -33,3 +33,6 @@ jobs:
 
       - name: CLI smoke test
         run: python xrpcli.py --help
+
+      - name: Stablecoins command smoke test
+        run: python xrpcli.py stablecoins --help
