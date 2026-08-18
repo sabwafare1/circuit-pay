@@ -317,7 +317,7 @@ def cmd_pay(args):
 
     try:
         wallet = Wallet.from_seed(secret)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - xrpl doesn't expose a fixed set of decode errors; any failure here means an invalid secret
         raise SystemExit(f"error: invalid {SECRET_ENV_VAR}: {e}")
 
     memos = None
@@ -345,7 +345,7 @@ def cmd_pay(args):
     client = JsonRpcClient(NETWORKS[network])
     try:
         response = submit_and_wait(payment, client, wallet)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - xrpl-py can raise various network/RPC errors here; any failure means submission didn't succeed
         raise SystemExit(f"error: payment submission failed: {e}")
 
     result_code = response.result.get("meta", {}).get("TransactionResult")

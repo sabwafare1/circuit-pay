@@ -308,17 +308,16 @@ class CmdPriceTests(unittest.TestCase):
 
     def test_uppercases_various_currency_codes(self):
         for currency, price in [("jpy", 150), ("gbp", 0.79), ("btc", 0.0000123)]:
-            with self.subTest(currency=currency):
-                with patch("xrpcli.fetch_price") as mock_fetch_price:
-                    mock_fetch_price.return_value = {"ripple": {currency: price}}
+            with self.subTest(currency=currency), patch("xrpcli.fetch_price") as mock_fetch_price:
+                mock_fetch_price.return_value = {"ripple": {currency: price}}
 
-                    buf = io.StringIO()
-                    with contextlib.redirect_stdout(buf):
-                        xrpcli.cmd_price(make_price_args(currency=currency))
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    xrpcli.cmd_price(make_price_args(currency=currency))
 
-                    self.assertIn(
-                        f"1 XRP = {price} {currency.upper()}", buf.getvalue()
-                    )
+                self.assertIn(
+                    f"1 XRP = {price} {currency.upper()}", buf.getvalue()
+                )
 
     @patch("xrpcli.fetch_price")
     def test_formats_integer_price_without_decimal_artifacts(self, mock_fetch_price):
@@ -628,9 +627,8 @@ class CmdPayTests(unittest.TestCase):
                 raise ImportError("No module named 'xrpl'")
             return real_import(name, *args, **kwargs)
 
-        with patch("builtins.__import__", side_effect=fake_import):
-            with self.assertRaises(SystemExit) as ctx:
-                xrpcli.cmd_pay(make_pay_args())
+        with patch("builtins.__import__", side_effect=fake_import), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
 
         self.assertIn("xrpl-py", str(ctx.exception))
         self.assertIn("pip install -r requirements.txt", str(ctx.exception))
@@ -651,9 +649,8 @@ class CmdPayTests(unittest.TestCase):
 
         with patch(
             "xrpl.wallet.Wallet.from_seed", side_effect=ValueError("bad checksum")
-        ):
-            with self.assertRaises(SystemExit) as ctx:
-                xrpcli.cmd_pay(make_pay_args())
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
 
         self.assertIn("invalid XRPL_SECRET", str(ctx.exception))
         self.assertIn("bad checksum", str(ctx.exception))
@@ -679,9 +676,8 @@ class CmdPayTests(unittest.TestCase):
         with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
             "xrpl.transaction.submit_and_wait",
             side_effect=Exception("connection refused"),
-        ), patch("xrpl.clients.JsonRpcClient"):
-            with self.assertRaises(SystemExit) as ctx:
-                xrpcli.cmd_pay(make_pay_args())
+        ), patch("xrpl.clients.JsonRpcClient"), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
 
         self.assertIn("payment submission failed", str(ctx.exception))
         self.assertIn("connection refused", str(ctx.exception))
@@ -755,9 +751,8 @@ class CmdPayTests(unittest.TestCase):
 
         with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
             "xrpl.transaction.submit_and_wait", return_value=mock_response
-        ), patch("xrpl.clients.JsonRpcClient"):
-            with self.assertRaises(SystemExit) as ctx:
-                xrpcli.cmd_pay(make_pay_args())
+        ), patch("xrpl.clients.JsonRpcClient"), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
 
         self.assertIn("tecUNFUNDED_PAYMENT", str(ctx.exception))
         self.assertEqual(entry["status"], "pending")
