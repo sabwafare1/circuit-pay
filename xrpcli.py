@@ -110,6 +110,16 @@ def drops_to_xrp(drops):
     return decimal.Decimal(drops) / 1_000_000
 
 
+def parse_stablecoin_amount(amount_str):
+    try:
+        amount = decimal.Decimal(amount_str)
+    except decimal.InvalidOperation:
+        raise SystemExit(f"error: '{amount_str}' is not a valid amount")
+    if amount <= 0:
+        raise SystemExit("error: amount must be greater than zero")
+    return amount
+
+
 def usd_to_drops(usd_amount, rate):
     xrp_amount = usd_amount / rate
     return int((xrp_amount * 1_000_000).to_integral_value(rounding=decimal.ROUND_HALF_UP))
@@ -658,6 +668,126 @@ def cmd_pay(args):
     print(f"Payment sent and validated. tx hash={tx_hash}")
 
 
+def cmd_send_stablecoin(args):
+    if not is_valid_classic_address(args.destination):
+        raise SystemExit(
+            f"error: '{args.destination}' is not a valid XRPL wallet address"
+        )
+
+    symbol = args.symbol.upper()
+    info = STABLECOINS.get(symbol)
+    if info is None:
+        raise SystemExit(
+            f"error: unknown stablecoin '{args.symbol}', must be one of: "
+            f"{', '.join(STABLECOINS)}"
+        )
+    issuer = info["issuers"].get(args.network)
+    if issuer is None:
+        raise SystemExit(f"error: no known {symbol} issuer for network '{args.network}'")
+
+    amount = parse_stablecoin_amount(args.amount)
+
+    if args.tag is not None and not (0 <= args.tag <= 0xFFFFFFFF):
+        raise SystemExit("error: --tag must be between 0 and 4294967295")
+
+    secret = os.environ.get(SECRET_ENV_VAR)
+    if not secret:
+        raise SystemExit(
+            f"error: set the {SECRET_ENV_VAR} environment variable to your wallet's "
+            "secret (seed) before sending"
+        )
+
+    fee_address = os.environ.get(PLATFORM_FEE_ADDRESS_ENV_VAR)
+    if not fee_address:
+        raise SystemExit(
+            f"error: set the {PLATFORM_FEE_ADDRESS_ENV_VAR} environment variable to the "
+            "platform's fee-collection wallet address before sending"
+        )
+
+    try:
+        from xrpl.clients import JsonRpcClient
+        from xrpl.models.amounts import IssuedCurrencyAmount
+        from xrpl.models.transactions import Payment
+        from xrpl.transaction import submit_and_wait
+        from xrpl.wallet import Wallet
+    except ImportError:
+        raise SystemExit(
+            "error: the 'xrpl-py' package is required to send payments. "
+            "Install it with: pip install -r requirements.txt"
+        )
+
+    try:
+        wallet = Wallet.from_seed(secret)
+    except Exception as e:  # noqa: BLE001 - xrpl doesn't expose a fixed set of decode errors; any failure here means an invalid secret
+        raise SystemExit(f"error: invalid {SECRET_ENV_VAR}: {e}")
+
+    ensure_payer_verified(wallet.address)
+
+    endpoint = NETWORKS[args.network]
+
+    # USDC/RLUSD are pegged ~1:1 to USD, so the send amount doubles as its
+    # USD value for platform fee purposes -- pay does the equivalent
+    # conversion for its XRP amount using the live market rate instead.
+    rate = get_usd_rate()
+    platform_fee_usd = calculate_platform_fee_usd(amount, args.fee_type)
+    platform_fee_drops = usd_to_drops(platform_fee_usd, rate)
+    network_fee_drops = fetch_network_fee_drops(endpoint)
+
+    payment = Payment(
+        account=wallet.address,
+        destination=args.destination,
+        destination_tag=args.tag,
+        amount=IssuedCurrencyAmount(currency=info["currency"], issuer=issuer, value=args.amount),
+    )
+
+    print(
+        f"Sending {args.amount} {symbol} from {wallet.address} to {args.destination} "
+        f"(tag {args.tag}) on {args.network}..."
+    )
+    print(f"  Amount:        {args.amount} {symbol}")
+    print(
+        f"  Platform fee:  {platform_fee_usd:.2f} USD (~{drops_to_xrp(platform_fee_drops)} XRP) "
+        f"[{args.fee_type}: {fee_description(args.fee_type)}]"
+    )
+    print(
+        f"  Network fee:   {drops_to_xrp(network_fee_drops)} XRP ({network_fee_drops} drops), "
+        "paid to the XRPL network"
+    )
+
+    client = JsonRpcClient(endpoint)
+    try:
+        response = submit_and_wait(payment, client, wallet)
+    except Exception as e:  # noqa: BLE001 - xrpl-py can raise various network/RPC errors here; any failure means submission didn't succeed
+        raise SystemExit(f"error: payment submission failed: {e}")
+
+    result_code = response.result.get("meta", {}).get("TransactionResult")
+    tx_hash = response.result.get("hash")
+
+    if result_code != "tesSUCCESS":
+        raise SystemExit(f"error: payment failed with result '{result_code}'")
+
+    # The platform fee is always collected from the sender in XRP, as a
+    # second transfer -- same treatment as pay, and it keeps the fee wallet
+    # from needing a trust line in every stablecoin this command supports.
+    fee_payment = Payment(
+        account=wallet.address,
+        destination=fee_address,
+        amount=str(platform_fee_drops),
+    )
+    try:
+        fee_response = submit_and_wait(fee_payment, client, wallet)
+    except Exception as e:  # noqa: BLE001 - a failed fee transfer shouldn't be mistaken for a failed main payment, which already succeeded
+        print(f"warning: platform fee payment failed to submit: {e}")
+    else:
+        fee_result = fee_response.result.get("meta", {}).get("TransactionResult")
+        if fee_result == "tesSUCCESS":
+            print(f"Platform fee sent. tx hash={fee_response.result.get('hash')}")
+        else:
+            print(f"warning: platform fee payment did not succeed (result '{fee_result}')")
+
+    print(f"Payment sent and validated. tx hash={tx_hash}")
+
+
 def cmd_check(args):
     requests_store = load_requests()
     entry = requests_store.get(args.request_id)
@@ -823,6 +953,37 @@ def build_parser():
     )
     pay.add_argument("request_id", help="the request ID printed by 'xrpcli.py request'")
     pay.set_defaults(func=cmd_pay)
+
+    send_stablecoin = subparsers.add_parser(
+        "send-stablecoin",
+        help="send USDC or RLUSD directly from your wallet to another address",
+    )
+    send_stablecoin.add_argument("destination", help="recipient's XRPL wallet address")
+    send_stablecoin.add_argument("amount", help="amount to send (e.g. 25)")
+    send_stablecoin.add_argument("symbol", help="which stablecoin to send: USDC or RLUSD (case-insensitive)")
+    send_stablecoin.add_argument(
+        "--tag",
+        type=int,
+        default=None,
+        help="XRPL destination tag to include with the payment (omit for none)",
+    )
+    send_stablecoin.add_argument(
+        "--network",
+        choices=NETWORKS.keys(),
+        default="mainnet",
+        help="XRPL network to send on (default: mainnet)",
+    )
+    send_stablecoin.add_argument(
+        "--type",
+        dest="fee_type",
+        choices=FEE_TYPES,
+        default="p2p",
+        help=(
+            "transaction type for platform fee purposes: 'p2p' (flat $0.10) or "
+            "'merchant' (0.5 percent, min $10, max $5000) (default: p2p)"
+        ),
+    )
+    send_stablecoin.set_defaults(func=cmd_send_stablecoin)
 
     check = subparsers.add_parser(
         "check",

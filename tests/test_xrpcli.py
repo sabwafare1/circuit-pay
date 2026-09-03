@@ -62,6 +62,24 @@ def make_pay_args(request_id="abc123"):
     return argparse.Namespace(request_id=request_id)
 
 
+def make_send_stablecoin_args(
+    destination=VALID_ADDRESS,
+    amount="25",
+    symbol="USDC",
+    tag=None,
+    network="mainnet",
+    fee_type="p2p",
+):
+    return argparse.Namespace(
+        destination=destination,
+        amount=amount,
+        symbol=symbol,
+        tag=tag,
+        network=network,
+        fee_type=fee_type,
+    )
+
+
 def make_check_args(request_id="abc123", limit=50):
     return argparse.Namespace(request_id=request_id, limit=limit)
 
@@ -1476,6 +1494,262 @@ class CmdPayTests(unittest.TestCase):
         self.assertIn("tecUNFUNDED_PAYMENT", str(ctx.exception))
         self.assertEqual(entry["status"], "pending")
         mock_save_requests.assert_not_called()
+
+
+class CmdSendStablecoinTests(unittest.TestCase):
+    def test_rejects_invalid_destination_address(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args(destination="notanaddress"))
+
+        self.assertIn("not a valid XRPL wallet address", str(ctx.exception))
+
+    def test_rejects_unknown_symbol(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args(symbol="DOGE"))
+
+        self.assertIn("unknown stablecoin 'DOGE'", str(ctx.exception))
+        self.assertIn("USDC", str(ctx.exception))
+        self.assertIn("RLUSD", str(ctx.exception))
+
+    def test_symbol_is_case_insensitive(self):
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args(symbol="usdc"))
+
+        # Gets past symbol/network validation and fails on the next check instead.
+        self.assertIn("XRPL_SECRET", str(ctx.exception))
+
+    def test_rejects_network_with_no_known_issuer(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args(network="devnet"))
+
+        self.assertIn("no known USDC issuer for network 'devnet'", str(ctx.exception))
+
+    def test_rejects_invalid_amount(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args(amount="not-a-number"))
+
+        self.assertIn("not a valid amount", str(ctx.exception))
+
+    def test_rejects_zero_amount(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args(amount="0"))
+
+        self.assertIn("amount must be greater than zero", str(ctx.exception))
+
+    def test_rejects_tag_out_of_range(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args(tag=99999999999))
+
+        self.assertIn("--tag must be between 0 and 4294967295", str(ctx.exception))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_requires_secret_env_var(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        self.assertIn("XRPL_SECRET", str(ctx.exception))
+
+    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    def test_requires_platform_fee_address_env_var(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        self.assertIn("PLATFORM_FEE_ADDRESS", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    def test_reports_missing_dependency_when_xrpl_py_not_installed(self):
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "xrpl" or name.startswith("xrpl."):
+                raise ImportError("No module named 'xrpl'")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        self.assertIn("xrpl-py", str(ctx.exception))
+        self.assertIn("pip install -r requirements.txt", str(ctx.exception))
+
+    @patch.dict(os.environ, {**PAY_ENV, "XRPL_SECRET": "not-a-real-seed"}, clear=True)
+    def test_reports_invalid_secret(self):
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", side_effect=ValueError("bad checksum")
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        self.assertIn("invalid XRPL_SECRET", str(ctx.exception))
+        self.assertIn("bad checksum", str(ctx.exception))
+
+    @patch.dict(
+        os.environ,
+        {"XRPL_SECRET": "sEdTest", "PLATFORM_FEE_ADDRESS": "rFeeCollector"},
+        clear=True,
+    )
+    def test_requires_veriff_credentials_env_vars(self):
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", return_value=mock_wallet
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        self.assertIn("VERIFF_API_KEY", str(ctx.exception))
+        self.assertIn("VERIFF_SHARED_SECRET", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.create_veriff_session")
+    @patch("xrpcli.save_verifications")
+    @patch("xrpcli.load_verifications", return_value={})
+    def test_first_send_creates_veriff_session_and_blocks(
+        self,
+        mock_load_verifications,
+        mock_save_verifications,
+        mock_create_session,
+    ):
+        mock_create_session.return_value = (
+            "sess-new",
+            "https://veriff.example/sessions/sess-new",
+        )
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", return_value=mock_wallet
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        mock_create_session.assert_called_once_with(
+            "rPayerAddress", "test-api-key", "test-shared-secret"
+        )
+        self.assertIn("has not completed identity verification", str(ctx.exception))
+        self.assertIn("https://veriff.example/sessions/sess-new", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
+    def test_reports_submission_failure(
+        self,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
+    ):
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait",
+            side_effect=Exception("connection refused"),
+        ), patch("xrpl.clients.JsonRpcClient"), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        self.assertIn("payment submission failed", str(ctx.exception))
+        self.assertIn("connection refused", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
+    def test_on_ledger_failure_is_reported_and_does_not_collect_fee(
+        self,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
+    ):
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        mock_response = unittest.mock.Mock()
+        mock_response.result = {
+            "meta": {"TransactionResult": "tecNO_LINE"},
+            "hash": "TXHASH123",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait", return_value=mock_response
+        ) as mock_submit, patch("xrpl.clients.JsonRpcClient"), self.assertRaises(
+            SystemExit
+        ) as ctx:
+            xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        self.assertIn("tecNO_LINE", str(ctx.exception))
+        # Only the main payment is attempted -- no fee is collected on a failed send.
+        mock_submit.assert_called_once()
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
+    def test_submits_payment_and_platform_fee_on_success(
+        self,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
+    ):
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        main_response = unittest.mock.Mock()
+        main_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "TXHASH123",
+        }
+        fee_response = unittest.mock.Mock()
+        fee_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "FEETXHASH",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait",
+            side_effect=[main_response, fee_response],
+        ) as mock_submit, patch("xrpl.clients.JsonRpcClient"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                xrpcli.cmd_send_stablecoin(make_send_stablecoin_args(amount="25", tag=42))
+
+        output = buf.getvalue()
+        self.assertIn("TXHASH123", output)
+        self.assertIn("Platform fee:  0.10 USD", output)
+        self.assertIn("Network fee:   0.00001 XRP (10 drops)", output)
+        self.assertIn("FEETXHASH", output)
+
+        self.assertEqual(mock_submit.call_count, 2)
+        sent_payment = mock_submit.call_args_list[0][0][0]
+        self.assertEqual(sent_payment.destination, VALID_ADDRESS)
+        self.assertEqual(sent_payment.destination_tag, 42)
+        self.assertEqual(sent_payment.amount.currency, xrpcli.STABLECOINS["USDC"]["currency"])
+        self.assertEqual(sent_payment.amount.issuer, xrpcli.STABLECOINS["USDC"]["issuers"]["mainnet"])
+        self.assertEqual(sent_payment.amount.value, "25")
+
+        fee_payment = mock_submit.call_args_list[1][0][0]
+        self.assertEqual(fee_payment.account, "rPayerAddress")
+        self.assertEqual(fee_payment.destination, "rFeeCollector")
+        self.assertEqual(fee_payment.amount, "100000")
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
+    def test_fee_payment_failure_warns_but_does_not_fail_the_send(
+        self,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
+    ):
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        main_response = unittest.mock.Mock()
+        main_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "TXHASH123",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait",
+            side_effect=[main_response, Exception("connection refused")],
+        ), patch("xrpl.clients.JsonRpcClient"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                xrpcli.cmd_send_stablecoin(make_send_stablecoin_args())
+
+        output = buf.getvalue()
+        self.assertIn("warning: platform fee payment failed to submit", output)
+        self.assertIn("Payment sent and validated. tx hash=TXHASH123", output)
 
 
 class CmdCheckTests(unittest.TestCase):

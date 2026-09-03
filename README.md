@@ -790,6 +790,96 @@ raises an error and also leaves the request `pending` without saving; and
 a fee payment that fails to submit only prints a `warning:` — the main
 payment already succeeded, so the request is still marked `paid`.
 
+### send-stablecoin
+
+Send USDC or RLUSD directly from your wallet to another address — a
+direct wallet-to-wallet transfer, not tied to the `request`/`pay`/`check`
+system above (there's no request ID, and nothing is written to
+`requests.json`). It's the wallet-to-wallet equivalent of `pay`: same
+identity verification gate, same mandatory platform fee, same
+`xrpl-py`/environment-variable requirements — just for an issued currency
+instead of XRP.
+
+```
+python xrpcli.py send-stablecoin <destination> <amount> <USDC|RLUSD> [--tag N] [--network mainnet|testnet|devnet] [--type p2p|merchant]
+```
+
+- `destination` — recipient's XRPL wallet address
+- `amount` — amount to send, in the stablecoin's own units (e.g. `25`)
+- `symbol` — `USDC` or `RLUSD` (case-insensitive)
+- `--tag` — XRPL destination tag to include (e.g. an exchange's deposit
+  tag); omitted entirely if not given, unlike `request`'s auto-generated
+  tag, since there's no local request to later match it against
+- `--network` — which XRPL network to send on (default: `mainnet`); each
+  stablecoin's issuer address is looked up per network the same way
+  [`stablecoins`](#stablecoins) does, and `devnet` has no known issuers
+  for either token
+- `--type` — `p2p` or `merchant` (default: `p2p`); which [platform
+  fee](#platform-fees) applies to this send
+
+**Platform fee:** USDC and RLUSD are pegged ~1:1 to USD, so the send
+amount is used directly as its USD value for fee purposes — no price
+lookup needed for the amount itself, unlike `pay`'s XRP amount. The fee
+itself is still settled in XRP (same as `pay`): computed from the live
+XRP/USD rate and sent as a second payment from the sender to
+`PLATFORM_FEE_ADDRESS` immediately after the main payment succeeds. If
+that second transaction fails, `send-stablecoin` prints a `warning:`
+rather than raising — the main payment already succeeded and is not
+rolled back — and prints the fee's own tx hash on success (there's no
+request entry to record it on, unlike `pay`'s `platform_fee_tx_hash`
+field).
+
+**Identity verification:** gated by the same [Veriff
+check](#identity-verification) as `pay`, keyed off the sender's wallet
+address — a wallet that's already completed verification via `pay`
+doesn't need to verify again to use `send-stablecoin`, and vice versa.
+
+**Error handling:** checked in order, before ever attempting to sign or
+submit anything:
+
+1. **Invalid destination** — `error: '<address>' is not a valid XRPL
+   wallet address`
+2. **Unknown symbol** — `error: unknown stablecoin '<symbol>', must be
+   one of: USDC, RLUSD`
+3. **No known issuer for the network** — `error: no known <SYMBOL> issuer
+   for network '<network>'`
+4. **Invalid amount** — `error: '<amount>' is not a valid amount` for
+   non-numeric input, or `error: amount must be greater than zero` for
+   zero/negative amounts
+5. **`--tag` out of range** — `error: --tag must be between 0 and
+   4294967295`
+6. **Missing `XRPL_SECRET`** — `error: set the XRPL_SECRET environment
+   variable to your wallet's secret (seed) before sending`
+7. **Missing `PLATFORM_FEE_ADDRESS`** — `error: set the
+   PLATFORM_FEE_ADDRESS environment variable to the platform's
+   fee-collection wallet address before sending`
+8. **`xrpl-py` not installed** — same error and fix as `pay`
+9. **Invalid secret** — same `error: invalid XRPL_SECRET: <reason>` as `pay`
+10. **Missing Veriff credentials / wallet not yet verified** — same errors
+    as [`pay`](#identity-verification), gating on the sender's address
+
+Once past all of that, submission failures are surfaced the same way as
+`pay` too: an unreachable node or failed submission is `error: payment
+submission failed: <reason>`, and a submitted-but-not-`tesSUCCESS` result
+(e.g. `tecNO_LINE` if the destination never trusted the currency,
+`tecPATH_DRY` if the sender's balance can't reach it) is `error: payment
+failed with result '<code>'` — in both cases no platform fee is
+attempted, since the main transfer didn't go through.
+
+**Tests:** `tests/test_xrpcli.py::CmdSendStablecoinTests` covers this
+without ever touching the real network or moving funds — `xrpl-py`'s
+`Wallet`/`submit_and_wait`/`JsonRpcClient` are all mocked. It checks every
+case listed under "Error handling" above (including that `symbol` is
+case-insensitive), plus: a wallet with no verification record yet has a
+session created (mocked) and the send blocked with the session URL; a
+successful send submits both the main `IssuedCurrencyAmount` payment (to
+the destination, in the requested symbol/network's issuer and currency
+code) and the platform-fee payment (in XRP, to `PLATFORM_FEE_ADDRESS`),
+printing both tx hashes; a non-`tesSUCCESS` result on the main payment
+only attempts that one submission, never the fee; and a fee payment that
+fails to submit only prints a `warning:` while the main payment's success
+is still reported.
+
 ### check
 
 Reconcile a payment request against what's actually happened on the
