@@ -300,11 +300,16 @@ by its ID. Creating the request itself runs entirely offline — no network
 call is made.
 
 ```
-python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network mainnet|testnet|devnet] [--type p2p|merchant]
+python xrpcli.py request <address> <amount> [--currency XRP|USDC|RLUSD] [--note TEXT] [--tag N] [--network mainnet|testnet|devnet] [--type p2p|merchant]
 ```
 
 - `address` — the merchant's XRPL wallet address to receive the payment
-- `amount` — exact amount to request, in XRP (up to 6 decimal places, e.g. `12.5`)
+- `amount` — exact amount to request (up to 6 decimal places for XRP, e.g.
+  `12.5`; arbitrary precision for a stablecoin, e.g. `25`)
+- `--currency` — `XRP`, `USDC`, or `RLUSD` (case-insensitive, default:
+  `XRP`); a stablecoin's issuer address is looked up per network the same
+  way [`stablecoins`](#stablecoins) does, so `devnet` has no known issuer
+  for either token
 - `--note` — a short note describing what the payment is for (embedded as a memo)
 - `--tag` — XRPL destination tag to identify this request (a random one is
   generated if omitted); useful for telling apart multiple incoming payments
@@ -321,7 +326,10 @@ characters rather than `qrcode`'s own Unicode block art, since that
 garbles on a Windows console stuck on a non-UTF-8 codepage. If `qrcode`
 isn't installed, `request` still works — everything else it prints is
 pure standard library — and just prints a one-line hint to install it
-instead of the QR block.
+instead of the QR block. For a stablecoin request, the URI (and therefore
+the QR code) also carries `currency`/`issuer` query params alongside
+`amount`, so a wallet scanning it has everything needed to build the exact
+on-ledger payment.
 
 **Request status tracking:** on success, `request` generates a short
 random ID (8 hex characters, e.g. `9cc8e589`) that doesn't collide with
@@ -332,6 +340,7 @@ next to `xrpcli.py` (local only — it's gitignored and never committed):
 {
   "address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
   "amount": "12.5",
+  "currency": "XRP",
   "tag": 777,
   "note": "Invoice #42",
   "network": "mainnet",
@@ -345,6 +354,9 @@ Every request starts life as `"status": "pending"`. From here, `pay
 <request-id>` (see above) is what looks the entry back up, and — only on
 a successful on-ledger payment — flips it to `"paid"` and records the
 transaction hash, payer address, and paid-at timestamp in the same entry.
+A request created before the `currency` field existed has no such key at
+all — `pay`/`check` treat that the same as `"currency": "XRP"`, so older
+entries in an existing `requests.json` keep working unchanged.
 
 **Error handling:** all validation happens before anything is written to
 the local request store, so a rejected request never leaves a partial
@@ -352,10 +364,18 @@ entry behind:
 
 - **Invalid address** — `error: '<address>' is not a valid XRPL wallet
   address` (same base58check validation used by `history`/`balance`)
-- **Invalid amount** — `error: '<amount>' is not a valid XRP amount` for
-  non-numeric input, `error: amount must be greater than zero` for
-  zero/negative amounts, or `error: XRP amounts support at most 6 decimal
-  places` if it has more precision than a drop can represent
+- **Unknown `--currency`** — `error: unknown stablecoin '<currency>', must
+  be one of: USDC, RLUSD` (only for a value that isn't `XRP` and isn't a
+  known stablecoin)
+- **No known issuer for the network** — `error: no known <SYMBOL> issuer
+  for network '<network>'` for a stablecoin currency on a network with no
+  known issuer (e.g. `devnet`)
+- **Invalid amount** — for `XRP`: `error: '<amount>' is not a valid XRP
+  amount` for non-numeric input, `error: amount must be greater than zero`
+  for zero/negative amounts, or `error: XRP amounts support at most 6
+  decimal places` if it has more precision than a drop can represent; for
+  a stablecoin: `error: '<amount>' is not a valid amount` or `error:
+  amount must be greater than zero` (no decimal-place cap)
 - **`--tag` out of range** — `error: --tag must be between 0 and
   4294967295` if given a value outside XRPL's 32-bit destination tag range
 
@@ -377,6 +397,17 @@ covers `render_qr_ascii` directly: every printed row is made up only of the
 two 2-character tokens it uses for dark/light modules, the rendered grid
 contains both, and different input data produces a different grid.
 
+The same test class covers `--currency`: an unknown currency and a
+stablecoin currency with no known issuer for the network are both rejected
+before saving; a successful `--currency USDC` request prints an
+`{amount} USDC` line (no drops), persists `"currency": "USDC"` on the
+entry, builds a dict-shaped (`{currency, issuer, value}`) `Amount` in the
+unsigned tx template, and includes `currency=`/`issuer=` params in the
+URI; and an XRP request (the default) still persists `"currency": "XRP"`.
+`tests/test_xrpcli.py::ResolveStablecoinTests` covers the shared
+`resolve_stablecoin` helper (also used by [`pay`](#pay), [`check`](#check),
+and [`send-stablecoin`](#send-stablecoin)) directly.
+
 Live example (run for real against the local request store — `request`
 itself makes no network call, but the request ID below is genuinely
 generated, not a placeholder):
@@ -384,14 +415,14 @@ generated, not a placeholder):
 ```
 $ python xrpcli.py request rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh 12.5 --note "Invoice #42" --tag 777
 Payment request created:
-  Request ID:       97b89188
+  Request ID:       710d6acd
   Pay to:           rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
   Amount:           12.5 XRP (12500000 drops)
   Destination tag:  777
   Note:             Invoice #42
   Fee type:         p2p (flat $0.10 fee)
 
-The customer can pay it directly with: xrpcli.py pay 97b89188
+The customer can pay it directly with: xrpcli.py pay 710d6acd
 
 Or give them this to pay manually (paste into a wallet):
   ripple:rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh?amount=12.5&dt=777&memo=Invoice+%2342
@@ -453,15 +484,74 @@ Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):
 
 $ cat requests.json
 {
-  "97b89188": {
+  "710d6acd": {
     "address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
     "amount": "12.5",
+    "currency": "XRP",
     "tag": 777,
     "note": "Invoice #42",
     "network": "mainnet",
     "fee_type": "p2p",
     "status": "pending",
-    "created_at": "2026-09-04T05:46:49.147387+00:00"
+    "created_at": "2026-09-04T06:02:13.355277+00:00"
+  }
+}
+```
+
+A stablecoin request works the same way, with `--currency` and a
+per-network issuer/currency code baked into both the URI and the unsigned
+tx template (live example, run for real against XRPL testnet):
+
+```
+$ python xrpcli.py request rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh 25 --currency USDC --note "Invoice #43" --tag 888 --network testnet
+Payment request created:
+  Request ID:       9ab638c6
+  Pay to:           rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
+  Amount:           25 USDC
+  Destination tag:  888
+  Note:             Invoice #43
+  Fee type:         p2p (flat $0.10 fee)
+
+The customer can pay it directly with: xrpcli.py pay 9ab638c6
+
+Or give them this to pay manually (paste into a wallet):
+  ripple:rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh?amount=25&currency=5553444300000000000000000000000000000000&issuer=rHuGNhqTG32mfmAvWA8hUyWRLV3tCSwKQt&dt=888&memo=Invoice+%2343
+
+Or have them scan this to pay:
+  (QR code omitted here for brevity -- rendered the same way as the XRP example above)
+
+Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):
+{
+  "TransactionType": "Payment",
+  "Destination": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+  "DestinationTag": 888,
+  "Amount": {
+    "currency": "5553444300000000000000000000000000000000",
+    "issuer": "rHuGNhqTG32mfmAvWA8hUyWRLV3tCSwKQt",
+    "value": "25"
+  },
+  "Memos": [
+    {
+      "Memo": {
+        "MemoData": "496E766F69636520233433",
+        "MemoFormat": "746578742F706C61696E"
+      }
+    }
+  ]
+}
+
+$ cat requests.json
+{
+  "9ab638c6": {
+    "address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+    "amount": "25",
+    "currency": "USDC",
+    "tag": 888,
+    "note": "Invoice #43",
+    "network": "testnet",
+    "fee_type": "p2p",
+    "status": "pending",
+    "created_at": "2026-09-04T06:02:13.522439+00:00"
   }
 }
 ```
@@ -616,6 +706,16 @@ verification](#identity-verification), then signs and submits the exact
 XRPL network on your behalf, plus the [platform fee](#platform-fees)
 computed from the request's `fee_type`. This one **moves real funds** and
 requires the `xrpl-py` package (`pip install -r requirements.txt`).
+
+`pay` settles a stablecoin-denominated request (created via
+[`request --currency USDC|RLUSD`](#request)) the same way it settles an
+XRP one — it reads the request's stored `currency` and builds an
+`IssuedCurrencyAmount` payment instead of a plain drops amount when it
+isn't `XRP` (falling back to `XRP` for a request created before this field
+existed). The [platform fee](#platform-fees) is still always settled in
+XRP, using the stablecoin amount directly as its USD value (~1:1 peg) the
+same way [`send-stablecoin`](#send-stablecoin) does — see that section for
+the full fee-basis writeup.
 
 ```
 python xrpcli.py pay <request-id>
@@ -847,6 +947,13 @@ raises an error and also leaves the request `pending` without saving; and
 a fee payment that fails to submit only prints a `warning:` — the main
 payment already succeeded, so the request is still marked `paid`.
 
+Two more cases cover stablecoin-denominated requests specifically: an
+entry with no `currency` key at all (predating this field) still pays as
+plain XRP; and a `"currency": "USDC"` entry submits an `IssuedCurrencyAmount`
+main payment (asserted against `STABLECOINS`' real currency code/issuer)
+while the platform fee is computed from the USDC amount directly (not
+multiplied by the XRP/USD rate) and still paid in XRP.
+
 ### send-stablecoin
 
 Send USDC or RLUSD directly from your wallet to another address — a
@@ -956,11 +1063,21 @@ python xrpcli.py check <request-id> [--limit N]
 
 It scans the merchant address's transaction history and looks for a
 `Payment` that matches **all** of: destination address, destination tag,
-the exact requested amount (in drops), and a `tesSUCCESS` result. A
-payment missing the tag, sent to the wrong address, short/over the exact
-amount, or not yet validated is not treated as a match — matching this
-project's "request an exact amount" philosophy, and avoiding crediting the
-wrong customer's payment to someone else's request on a shared address.
+the exact requested amount, and a `tesSUCCESS` result. A payment missing
+the tag, sent to the wrong address, short/over the exact amount, or not
+yet validated is not treated as a match — matching this project's "request
+an exact amount" philosophy, and avoiding crediting the wrong customer's
+payment to someone else's request on a shared address.
+
+For a stablecoin-denominated request (see [`request
+--currency`](#request)), "the exact requested amount" means the ledger
+transaction's `Amount` is a `{currency, issuer, value}` object matching
+the request's stablecoin and issuer for its network, with `value` equal
+to the requested amount (compared numerically, not as a literal string,
+since the ledger's own formatting of a value can differ from what was
+typed) — an XRP request still matches on a plain drops string, exactly as
+before. A request created before the `currency` field existed (no such
+key at all) is matched as `XRP`, same as `pay`.
 
 **Request status tracking:** `check` reads and writes the same
 `requests.json` entry that `request` creates and `pay` can also settle
@@ -1010,7 +1127,11 @@ before any network call; a matching `Payment` marks the request paid with
 the right `tx_hash`/`paid_by`/`verified_via`; an empty transaction list
 reports no match without saving; and transactions that are the wrong type,
 wrong destination tag, wrong amount, or not `tesSUCCESS` are each
-correctly ignored rather than matched.
+correctly ignored rather than matched. For a stablecoin request: a
+transaction with the correct `{currency, issuer, value}` `Amount` marks it
+paid; one with the wrong issuer, wrong currency, or wrong value is
+correctly ignored; and a plain XRP-drops `Amount` doesn't accidentally
+match a stablecoin request either.
 
 Live example (run for real against XRPL testnet with two throwaway
 faucet-funded wallets — the payer wallet paid the request directly with
@@ -1038,4 +1159,13 @@ Match found - request '280aec91' is now marked paid.
 
 $ python xrpcli.py check 280aec91
 Request '280aec91' is already marked paid (tx hash=279D6D3424DC83535D6A24A189C67FE488A39B81B73ABC1B26D538E3F8A37F56).
+```
+
+The "no match yet" case reads the same way for a stablecoin request (live
+example, checking the USDC request created in [`request`](#request)'s
+stablecoin example above, run for real against testnet):
+
+```
+$ python xrpcli.py check 9ab638c6
+No matching payment found yet for request '9ab638c6' (25 USDC to rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh with tag 888 on testnet).
 ```

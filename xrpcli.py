@@ -120,6 +120,20 @@ def parse_stablecoin_amount(amount_str):
     return amount
 
 
+def resolve_stablecoin(symbol_str, network):
+    symbol = symbol_str.upper()
+    info = STABLECOINS.get(symbol)
+    if info is None:
+        raise SystemExit(
+            f"error: unknown stablecoin '{symbol_str}', must be one of: "
+            f"{', '.join(STABLECOINS)}"
+        )
+    issuer = info["issuers"].get(network)
+    if issuer is None:
+        raise SystemExit(f"error: no known {symbol} issuer for network '{network}'")
+    return symbol, info["currency"], issuer
+
+
 def usd_to_drops(usd_amount, rate):
     xrp_amount = usd_amount / rate
     return int((xrp_amount * 1_000_000).to_integral_value(rounding=decimal.ROUND_HALF_UP))
@@ -158,8 +172,11 @@ def fetch_network_fee_drops(endpoint):
     return int(result["drops"]["base_fee"])
 
 
-def build_payment_uri(address, amount_str, tag, note):
-    params = [("amount", amount_str), ("dt", str(tag))]
+def build_payment_uri(address, amount_str, tag, note, currency_code=None, issuer=None):
+    params = [("amount", amount_str)]
+    if currency_code and issuer:
+        params += [("currency", currency_code), ("issuer", issuer)]
+    params.append(("dt", str(tag)))
     if note:
         params.append(("memo", note))
     return f"ripple:{address}?{urllib.parse.urlencode(params)}"
@@ -498,17 +515,30 @@ def cmd_request(args):
             f"error: '{args.address}' is not a valid XRPL wallet address"
         )
 
-    drops = xrp_to_drops(args.amount)
+    currency = args.currency.upper()
+    if currency == "XRP":
+        currency_code = None
+        issuer = None
+        drops = xrp_to_drops(args.amount)
+    else:
+        currency, currency_code, issuer = resolve_stablecoin(args.currency, args.network)
+        drops = None
+        parse_stablecoin_amount(args.amount)
 
     if args.tag is not None and not (0 <= args.tag <= 0xFFFFFFFF):
         raise SystemExit("error: --tag must be between 0 and 4294967295")
     tag = args.tag if args.tag is not None else secrets.randbelow(0xFFFFFFFF) + 1
 
+    if currency == "XRP":
+        amount_field = str(drops)
+    else:
+        amount_field = {"currency": currency_code, "issuer": issuer, "value": args.amount}
+
     tx_template = {
         "TransactionType": "Payment",
         "Destination": args.address,
         "DestinationTag": tag,
-        "Amount": str(drops),
+        "Amount": amount_field,
     }
     if args.note:
         tx_template["Memos"] = [
@@ -520,13 +550,14 @@ def cmd_request(args):
             }
         ]
 
-    uri = build_payment_uri(args.address, args.amount, tag, args.note)
+    uri = build_payment_uri(args.address, args.amount, tag, args.note, currency_code, issuer)
 
     requests_store = load_requests()
     request_id = new_request_id(requests_store)
     requests_store[request_id] = {
         "address": args.address,
         "amount": args.amount,
+        "currency": currency,
         "tag": tag,
         "note": args.note,
         "network": args.network,
@@ -536,10 +567,12 @@ def cmd_request(args):
     }
     save_requests(requests_store)
 
+    amount_display = f"{args.amount} XRP ({drops} drops)" if currency == "XRP" else f"{args.amount} {currency}"
+
     print("Payment request created:")
     print(f"  Request ID:       {request_id}")
     print(f"  Pay to:           {args.address}")
-    print(f"  Amount:           {args.amount} XRP ({drops} drops)")
+    print(f"  Amount:           {amount_display}")
     print(f"  Destination tag:  {tag}")
     if args.note:
         print(f"  Note:             {args.note}")
@@ -589,6 +622,7 @@ def cmd_pay(args):
 
     try:
         from xrpl.clients import JsonRpcClient
+        from xrpl.models.amounts import IssuedCurrencyAmount
         from xrpl.models.transactions import Memo, Payment
         from xrpl.transaction import submit_and_wait
         from xrpl.wallet import Wallet
@@ -605,13 +639,24 @@ def cmd_pay(args):
 
     ensure_payer_verified(wallet.address)
 
-    drops = xrp_to_drops(entry["amount"])
+    currency = entry.get("currency", "XRP")
     network = entry.get("network", "mainnet")
     endpoint = NETWORKS[network]
 
+    if currency == "XRP":
+        drops = xrp_to_drops(entry["amount"])
+        payment_amount = str(drops)
+    else:
+        _, currency_code, issuer = resolve_stablecoin(currency, network)
+        payment_amount = IssuedCurrencyAmount(
+            currency=currency_code, issuer=issuer, value=entry["amount"]
+        )
+
     fee_type = entry.get("fee_type", "p2p")
     rate = get_usd_rate()
-    amount_usd = decimal.Decimal(entry["amount"]) * rate
+    # USDC/RLUSD are pegged ~1:1 to USD, so the request amount doubles as its
+    # USD value directly -- an XRP amount still needs the live rate applied.
+    amount_usd = decimal.Decimal(entry["amount"]) * rate if currency == "XRP" else decimal.Decimal(entry["amount"])
     platform_fee_usd = calculate_platform_fee_usd(amount_usd, fee_type)
     platform_fee_drops = usd_to_drops(platform_fee_usd, rate)
     network_fee_drops = fetch_network_fee_drops(endpoint)
@@ -628,16 +673,20 @@ def cmd_pay(args):
     payment = Payment(
         account=wallet.address,
         destination=entry["address"],
-        amount=str(drops),
+        amount=payment_amount,
         destination_tag=entry.get("tag"),
         memos=memos,
     )
 
+    amount_display = (
+        f"{entry['amount']} XRP ({drops} drops)" if currency == "XRP" else f"{entry['amount']} {currency}"
+    )
+
     print(
-        f"Sending {entry['amount']} XRP from {wallet.address} to {entry['address']} "
+        f"Sending {entry['amount']} {currency} from {wallet.address} to {entry['address']} "
         f"(tag {entry.get('tag')}) on {network}..."
     )
-    print(f"  Amount:        {entry['amount']} XRP ({drops} drops)")
+    print(f"  Amount:        {amount_display}")
     print(
         f"  Platform fee:  {platform_fee_usd:.2f} USD (~{drops_to_xrp(platform_fee_drops)} XRP) "
         f"[{fee_type}: {fee_description(fee_type)}]"
@@ -697,16 +746,7 @@ def cmd_send_stablecoin(args):
             f"error: '{args.destination}' is not a valid XRPL wallet address"
         )
 
-    symbol = args.symbol.upper()
-    info = STABLECOINS.get(symbol)
-    if info is None:
-        raise SystemExit(
-            f"error: unknown stablecoin '{args.symbol}', must be one of: "
-            f"{', '.join(STABLECOINS)}"
-        )
-    issuer = info["issuers"].get(args.network)
-    if issuer is None:
-        raise SystemExit(f"error: no known {symbol} issuer for network '{args.network}'")
+    symbol, currency_code, issuer = resolve_stablecoin(args.symbol, args.network)
 
     amount = parse_stablecoin_amount(args.amount)
 
@@ -760,7 +800,7 @@ def cmd_send_stablecoin(args):
         account=wallet.address,
         destination=args.destination,
         destination_tag=args.tag,
-        amount=IssuedCurrencyAmount(currency=info["currency"], issuer=issuer, value=args.amount),
+        amount=IssuedCurrencyAmount(currency=currency_code, issuer=issuer, value=args.amount),
     )
 
     print(
@@ -824,9 +864,25 @@ def cmd_check(args):
         )
         return
 
-    expected_drops = xrp_to_drops(entry["amount"])
+    currency = entry.get("currency", "XRP")
     network = entry.get("network", "mainnet")
     endpoint = NETWORKS[network]
+
+    if currency == "XRP":
+        expected_drops = xrp_to_drops(entry["amount"])
+
+        def amount_matches(tx_amount):
+            return tx_amount == str(expected_drops)
+    else:
+        _, currency_code, issuer = resolve_stablecoin(currency, network)
+
+        def amount_matches(tx_amount):
+            return (
+                isinstance(tx_amount, dict)
+                and tx_amount.get("currency") == currency_code
+                and tx_amount.get("issuer") == issuer
+                and decimal.Decimal(tx_amount.get("value", "0")) == decimal.Decimal(entry["amount"])
+            )
 
     result = rpc_call(
         endpoint,
@@ -856,7 +912,7 @@ def cmd_check(args):
             continue
         if tx.get("DestinationTag") != entry.get("tag"):
             continue
-        if tx.get("Amount") != str(expected_drops):
+        if not amount_matches(tx.get("Amount")):
             continue
 
         entry["status"] = "paid"
@@ -873,7 +929,7 @@ def cmd_check(args):
 
     print(
         f"No matching payment found yet for request '{args.request_id}' "
-        f"({entry['amount']} XRP to {entry['address']} with tag {entry.get('tag')} "
+        f"({entry['amount']} {currency} to {entry['address']} with tag {entry.get('tag')} "
         f"on {network})."
     )
 
@@ -943,7 +999,12 @@ def build_parser():
         "request", help="create a payment request for a customer to pay"
     )
     request.add_argument("address", help="merchant's XRPL wallet address to receive payment")
-    request.add_argument("amount", help="exact amount to request, in XRP (e.g. 12.5)")
+    request.add_argument("amount", help="exact amount to request (e.g. 12.5)")
+    request.add_argument(
+        "--currency",
+        default="XRP",
+        help="currency to request: XRP, USDC, or RLUSD (case-insensitive, default: XRP)",
+    )
     request.add_argument(
         "--note", default=None, help="a short note describing what the payment is for"
     )

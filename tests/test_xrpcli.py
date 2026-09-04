@@ -43,6 +43,7 @@ def make_args(address=VALID_ADDRESS, network="mainnet", limit=20):
 def make_request_args(
     address=VALID_ADDRESS,
     amount="10",
+    currency="XRP",
     note=None,
     tag=None,
     network="mainnet",
@@ -51,6 +52,7 @@ def make_request_args(
     return argparse.Namespace(
         address=address,
         amount=amount,
+        currency=currency,
         note=note,
         tag=tag,
         network=network,
@@ -854,6 +856,41 @@ class BuildPaymentUriTests(unittest.TestCase):
         uri = xrpcli.build_payment_uri(VALID_ADDRESS, "3", 5, "Invoice #42")
         self.assertIn("memo=Invoice+%2342", uri)
 
+    def test_omits_currency_and_issuer_by_default(self):
+        uri = xrpcli.build_payment_uri(VALID_ADDRESS, "12.5", 777, None)
+        self.assertNotIn("currency=", uri)
+        self.assertNotIn("issuer=", uri)
+
+    def test_includes_currency_and_issuer_when_given(self):
+        uri = xrpcli.build_payment_uri(
+            VALID_ADDRESS, "25", 777, None, "5553444300000000000000000000000000000000", "rIssuerAddr"
+        )
+        self.assertIn("currency=5553444300000000000000000000000000000000", uri)
+        self.assertIn("issuer=rIssuerAddr", uri)
+
+
+class ResolveStablecoinTests(unittest.TestCase):
+    def test_resolves_known_symbol_and_network(self):
+        symbol, currency_code, issuer = xrpcli.resolve_stablecoin("usdc", "mainnet")
+
+        self.assertEqual(symbol, "USDC")
+        self.assertEqual(currency_code, xrpcli.STABLECOINS["USDC"]["currency"])
+        self.assertEqual(issuer, xrpcli.STABLECOINS["USDC"]["issuers"]["mainnet"])
+
+    def test_rejects_unknown_symbol(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.resolve_stablecoin("DOGE", "mainnet")
+
+        self.assertIn("unknown stablecoin 'DOGE'", str(ctx.exception))
+        self.assertIn("USDC", str(ctx.exception))
+        self.assertIn("RLUSD", str(ctx.exception))
+
+    def test_rejects_network_with_no_known_issuer(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.resolve_stablecoin("USDC", "devnet")
+
+        self.assertIn("no known USDC issuer for network 'devnet'", str(ctx.exception))
+
 
 class CmdRequestTests(unittest.TestCase):
     def test_rejects_invalid_address(self):
@@ -975,6 +1012,68 @@ class CmdRequestTests(unittest.TestCase):
         saved = mock_save_requests.call_args[0][0]
         entry = next(iter(saved.values()))
         self.assertEqual(entry["fee_type"], "merchant")
+
+    def test_rejects_unknown_currency(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_request(make_request_args(currency="DOGE"))
+
+        self.assertIn("unknown stablecoin 'DOGE'", str(ctx.exception))
+
+    def test_rejects_currency_with_no_known_issuer_for_network(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_request(make_request_args(currency="USDC", network="devnet"))
+
+        self.assertIn("no known USDC issuer for network 'devnet'", str(ctx.exception))
+
+    def test_rejects_invalid_stablecoin_amount(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_request(make_request_args(currency="USDC", amount="not-a-number"))
+
+        self.assertIn("not a valid amount", str(ctx.exception))
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_stablecoin_request_prints_and_persists_currency(
+        self, mock_load_requests, mock_save_requests
+    ):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_request(
+                make_request_args(currency="usdc", amount="25", tag=777, network="testnet")
+            )
+
+        output = buf.getvalue()
+        self.assertIn("Amount:           25 USDC", output)
+        self.assertNotIn("drops", output)
+        self.assertIn("currency=5553444300000000000000000000000000000000", output)
+        self.assertIn(f"issuer={xrpcli.STABLECOINS['USDC']['issuers']['testnet']}", output)
+
+        saved = mock_save_requests.call_args[0][0]
+        entry = next(iter(saved.values()))
+        self.assertEqual(entry["currency"], "USDC")
+        self.assertEqual(entry["amount"], "25")
+
+        tx_json = json.loads(output[output.index("{") : output.rindex("}") + 1])
+        self.assertEqual(
+            tx_json["Amount"],
+            {
+                "currency": xrpcli.STABLECOINS["USDC"]["currency"],
+                "issuer": xrpcli.STABLECOINS["USDC"]["issuers"]["testnet"],
+                "value": "25",
+            },
+        )
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_xrp_request_still_persists_currency_field_as_xrp(
+        self, mock_load_requests, mock_save_requests
+    ):
+        with contextlib.redirect_stdout(io.StringIO()):
+            xrpcli.cmd_request(make_request_args())
+
+        saved = mock_save_requests.call_args[0][0]
+        entry = next(iter(saved.values()))
+        self.assertEqual(entry["currency"], "XRP")
 
     @patch("xrpcli.save_requests")
     @patch("xrpcli.load_requests", return_value={})
@@ -1415,6 +1514,113 @@ class CmdPayTests(unittest.TestCase):
         self.assertEqual(entry["network_fee_drops"], 10)
         self.assertEqual(entry["platform_fee_tx_hash"], "FEETXHASH")
         mock_save_requests.assert_called_once()
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value=USD_RATE_RESPONSE)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_entry_without_currency_field_still_pays_as_xrp(
+        self,
+        mock_load_requests,
+        mock_save_requests,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
+    ):
+        # Simulates a request created before the currency field existed.
+        entry = {
+            "status": "pending",
+            "address": VALID_ADDRESS,
+            "amount": "5",
+            "tag": 42,
+            "note": None,
+            "network": "mainnet",
+        }
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        main_response = unittest.mock.Mock()
+        main_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "TXHASH123",
+        }
+        fee_response = unittest.mock.Mock()
+        fee_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "FEETXHASH",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait",
+            side_effect=[main_response, fee_response],
+        ) as mock_submit, patch("xrpl.clients.JsonRpcClient"):
+            xrpcli.cmd_pay(make_pay_args())
+
+        sent_payment = mock_submit.call_args_list[0][0][0]
+        self.assertEqual(sent_payment.amount, "5000000")
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.rpc_call", return_value=NETWORK_FEE_RESPONSE)
+    @patch("xrpcli.fetch_price", return_value={"ripple": {"usd": 2.0}})
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_stablecoin_request_submits_issued_currency_payment_with_xrp_fee(
+        self,
+        mock_load_requests,
+        mock_save_requests,
+        mock_fetch_price,
+        mock_rpc_call,
+        mock_load_verifications,
+    ):
+        entry = {
+            "status": "pending",
+            "address": VALID_ADDRESS,
+            "amount": "3000",
+            "currency": "USDC",
+            "tag": 42,
+            "note": None,
+            "network": "mainnet",
+            "fee_type": "merchant",
+        }
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        main_response = unittest.mock.Mock()
+        main_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "TXHASH123",
+        }
+        fee_response = unittest.mock.Mock()
+        fee_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "FEETXHASH",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait",
+            side_effect=[main_response, fee_response],
+        ) as mock_submit, patch("xrpl.clients.JsonRpcClient"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                xrpcli.cmd_pay(make_pay_args())
+
+        output = buf.getvalue()
+        self.assertIn("Sending 3000 USDC from", output)
+        self.assertIn("Amount:        3000 USDC", output)
+
+        main_payment = mock_submit.call_args_list[0][0][0]
+        self.assertEqual(main_payment.amount.currency, xrpcli.STABLECOINS["USDC"]["currency"])
+        self.assertEqual(main_payment.amount.issuer, xrpcli.STABLECOINS["USDC"]["issuers"]["mainnet"])
+        self.assertEqual(main_payment.amount.value, "3000")
+
+        # 0.5% of $3000 (the USDC amount used directly as its USD value,
+        # NOT multiplied by the 2.0 rate the way an XRP amount would be) is
+        # $15, converted to drops at that same 2.0 rate: 7.5 XRP.
+        fee_payment = mock_submit.call_args_list[1][0][0]
+        self.assertEqual(fee_payment.amount, "7500000")
 
     @patch.dict(os.environ, PAY_ENV, clear=True)
     @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
@@ -1989,6 +2195,122 @@ class CmdCheckTests(unittest.TestCase):
             xrpcli.cmd_check(make_check_args())
 
         self.assertIn("account not found", str(ctx.exception))
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_marks_paid_when_matching_stablecoin_payment_found(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry(currency="USDC", amount="25")
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [
+                    make_account_tx_entry(
+                        amount={
+                            "currency": xrpcli.STABLECOINS["USDC"]["currency"],
+                            "issuer": xrpcli.STABLECOINS["USDC"]["issuers"]["mainnet"],
+                            "value": "25",
+                        }
+                    )
+                ],
+            }
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_check(make_check_args())
+
+        self.assertIn("Match found", buf.getvalue())
+        self.assertEqual(entry["status"], "paid")
+        mock_save_requests.assert_called_once()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_ignores_stablecoin_payment_with_wrong_issuer(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry(currency="USDC", amount="25")
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [
+                    make_account_tx_entry(
+                        amount={
+                            "currency": xrpcli.STABLECOINS["USDC"]["currency"],
+                            "issuer": "rSomeOtherIssuer",
+                            "value": "25",
+                        }
+                    )
+                ],
+            }
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_check(make_check_args())
+
+        self.assertIn("No matching payment found yet", buf.getvalue())
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_ignores_stablecoin_payment_with_wrong_value(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry(currency="USDC", amount="25")
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [
+                    make_account_tx_entry(
+                        amount={
+                            "currency": xrpcli.STABLECOINS["USDC"]["currency"],
+                            "issuer": xrpcli.STABLECOINS["USDC"]["issuers"]["mainnet"],
+                            "value": "24.99",
+                        }
+                    )
+                ],
+            }
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_check(make_check_args())
+
+        self.assertIn("No matching payment found yet", buf.getvalue())
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_ignores_xrp_drops_payment_when_request_is_a_stablecoin(
+        self, mock_load_requests, mock_rpc_call, mock_save_requests
+    ):
+        entry = self.make_pending_entry(currency="USDC", amount="25")
+        mock_load_requests.return_value = {"abc123": entry}
+        mock_rpc_call.return_value = {
+            "result": {
+                "status": "success",
+                "transactions": [make_account_tx_entry(amount="25000000")],
+            }
+        }
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_check(make_check_args())
+
+        self.assertIn("No matching payment found yet", buf.getvalue())
+        self.assertEqual(entry["status"], "pending")
+        mock_save_requests.assert_not_called()
 
 
 if __name__ == "__main__":
