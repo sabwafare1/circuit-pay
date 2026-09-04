@@ -39,3 +39,6 @@ jobs:
 
       - name: Send-stablecoin command smoke test
         run: python xrpcli.py send-stablecoin --help
+
+      - name: Refund command smoke test
+        run: python xrpcli.py refund --help

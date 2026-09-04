@@ -600,6 +600,11 @@ def cmd_pay(args):
     entry = requests_store.get(args.request_id)
     if entry is None:
         raise SystemExit(f"error: no payment request found with id '{args.request_id}'")
+    if entry["status"] == "refunded":
+        raise SystemExit(
+            f"error: request '{args.request_id}' was already paid and refunded "
+            f"(tx hash={entry.get('tx_hash')})"
+        )
     if entry["status"] == "paid":
         raise SystemExit(
             f"error: request '{args.request_id}' was already paid "
@@ -740,6 +745,100 @@ def cmd_pay(args):
     print(f"Payment sent and validated. tx hash={tx_hash}")
 
 
+def cmd_refund(args):
+    requests_store = load_requests()
+    entry = requests_store.get(args.request_id)
+    if entry is None:
+        raise SystemExit(f"error: no payment request found with id '{args.request_id}'")
+    if entry["status"] == "refunded":
+        raise SystemExit(
+            f"error: request '{args.request_id}' was already refunded "
+            f"(tx hash={entry.get('refund_tx_hash')})"
+        )
+    if entry["status"] != "paid":
+        raise SystemExit(
+            f"error: request '{args.request_id}' has not been paid yet, nothing to refund"
+        )
+
+    paid_by = entry["paid_by"]
+
+    secret = os.environ.get(SECRET_ENV_VAR)
+    if not secret:
+        raise SystemExit(
+            f"error: set the {SECRET_ENV_VAR} environment variable to the wallet's "
+            "secret (seed) that received the payment before refunding"
+        )
+
+    try:
+        from xrpl.clients import JsonRpcClient
+        from xrpl.models.amounts import IssuedCurrencyAmount
+        from xrpl.models.transactions import Payment
+        from xrpl.transaction import submit_and_wait
+        from xrpl.wallet import Wallet
+    except ImportError:
+        raise SystemExit(
+            "error: the 'xrpl-py' package is required to send payments. "
+            "Install it with: pip install -r requirements.txt"
+        )
+
+    try:
+        wallet = Wallet.from_seed(secret)
+    except Exception as e:  # noqa: BLE001 - xrpl doesn't expose a fixed set of decode errors; any failure here means an invalid secret
+        raise SystemExit(f"error: invalid {SECRET_ENV_VAR}: {e}")
+
+    if wallet.address != entry["address"]:
+        raise SystemExit(
+            f"error: XRPL_SECRET belongs to {wallet.address}, but this request was paid "
+            f"to {entry['address']} -- a refund must be signed by the wallet that received "
+            "the original payment"
+        )
+
+    ensure_payer_verified(wallet.address)
+
+    currency = entry.get("currency", "XRP")
+    network = entry.get("network", "mainnet")
+    endpoint = NETWORKS[network]
+
+    if currency == "XRP":
+        drops = xrp_to_drops(entry["amount"])
+        payment_amount = str(drops)
+    else:
+        _, currency_code, issuer = resolve_stablecoin(currency, network)
+        payment_amount = IssuedCurrencyAmount(
+            currency=currency_code, issuer=issuer, value=entry["amount"]
+        )
+
+    payment = Payment(
+        account=wallet.address,
+        destination=paid_by,
+        amount=payment_amount,
+    )
+
+    print(
+        f"Refunding {entry['amount']} {currency} from {wallet.address} to {paid_by} "
+        f"on {network}..."
+    )
+
+    client = JsonRpcClient(endpoint)
+    try:
+        response = submit_and_wait(payment, client, wallet)
+    except Exception as e:  # noqa: BLE001 - xrpl-py can raise various network/RPC errors here; any failure means submission didn't succeed
+        raise SystemExit(f"error: refund submission failed: {e}")
+
+    result_code = response.result.get("meta", {}).get("TransactionResult")
+    tx_hash = response.result.get("hash")
+
+    if result_code != "tesSUCCESS":
+        raise SystemExit(f"error: refund failed with result '{result_code}'")
+
+    entry["status"] = "refunded"
+    entry["refund_tx_hash"] = tx_hash
+    entry["refunded_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    save_requests(requests_store)
+
+    print(f"Refund sent and validated. tx hash={tx_hash}")
+
+
 def cmd_send_stablecoin(args):
     if not is_valid_classic_address(args.destination):
         raise SystemExit(
@@ -856,6 +955,13 @@ def cmd_check(args):
     entry = requests_store.get(args.request_id)
     if entry is None:
         raise SystemExit(f"error: no payment request found with id '{args.request_id}'")
+
+    if entry["status"] == "refunded":
+        print(
+            f"Request '{args.request_id}' was paid and has since been refunded "
+            f"(refund tx hash={entry.get('refund_tx_hash')})."
+        )
+        return
 
     if entry["status"] == "paid":
         print(
@@ -1037,6 +1143,12 @@ def build_parser():
     )
     pay.add_argument("request_id", help="the request ID printed by 'xrpcli.py request'")
     pay.set_defaults(func=cmd_pay)
+
+    refund = subparsers.add_parser(
+        "refund", help="refund a paid request back to whoever paid it"
+    )
+    refund.add_argument("request_id", help="the request ID printed by 'xrpcli.py request'")
+    refund.set_defaults(func=cmd_refund)
 
     send_stablecoin = subparsers.add_parser(
         "send-stablecoin",

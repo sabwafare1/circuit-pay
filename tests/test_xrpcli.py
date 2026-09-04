@@ -64,6 +64,10 @@ def make_pay_args(request_id="abc123"):
     return argparse.Namespace(request_id=request_id)
 
 
+def make_refund_args(request_id="abc123"):
+    return argparse.Namespace(request_id=request_id)
+
+
 def make_send_stablecoin_args(
     destination=VALID_ADDRESS,
     amount="25",
@@ -1195,6 +1199,17 @@ class CmdPayTests(unittest.TestCase):
         self.assertIn("already paid", str(ctx.exception))
         self.assertIn("DEADBEEF", str(ctx.exception))
 
+    @patch("xrpcli.load_requests")
+    def test_rejects_refunded_request(self, mock_load_requests):
+        mock_load_requests.return_value = {
+            "abc123": {"status": "refunded", "tx_hash": "DEADBEEF", "refund_tx_hash": "REFUNDHASH"}
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_pay(make_pay_args())
+
+        self.assertIn("already paid and refunded", str(ctx.exception))
+
     @patch.dict(os.environ, {}, clear=True)
     @patch("xrpcli.load_requests")
     def test_requires_secret_env_var(self, mock_load_requests):
@@ -1758,6 +1773,232 @@ class CmdPayTests(unittest.TestCase):
         mock_save_requests.assert_not_called()
 
 
+class CmdRefundTests(unittest.TestCase):
+    def make_paid_entry(self, **overrides):
+        entry = {
+            "status": "paid",
+            "address": "rPayerAddress",
+            "amount": "5",
+            "currency": "XRP",
+            "tag": 42,
+            "note": None,
+            "network": "mainnet",
+            "tx_hash": "ORIGINALTXHASH",
+            "paid_by": VALID_ADDRESS,
+        }
+        entry.update(overrides)
+        return entry
+
+    @patch("xrpcli.load_requests", return_value={})
+    def test_rejects_unknown_request_id(self, mock_load_requests):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args(request_id="doesnotexist"))
+
+        self.assertIn("no payment request found", str(ctx.exception))
+
+    @patch("xrpcli.load_requests")
+    def test_rejects_pending_request(self, mock_load_requests):
+        mock_load_requests.return_value = {
+            "abc123": self.make_paid_entry(status="pending")
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("has not been paid yet", str(ctx.exception))
+
+    @patch("xrpcli.load_requests")
+    def test_rejects_already_refunded_request(self, mock_load_requests):
+        mock_load_requests.return_value = {
+            "abc123": self.make_paid_entry(status="refunded", refund_tx_hash="REFUNDHASH")
+        }
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("already refunded", str(ctx.exception))
+        self.assertIn("REFUNDHASH", str(ctx.exception))
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("xrpcli.load_requests")
+    def test_requires_secret_env_var(self, mock_load_requests):
+        mock_load_requests.return_value = {"abc123": self.make_paid_entry()}
+
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("XRPL_SECRET", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_requests")
+    def test_reports_missing_dependency_when_xrpl_py_not_installed(
+        self, mock_load_requests
+    ):
+        mock_load_requests.return_value = {"abc123": self.make_paid_entry()}
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "xrpl" or name.startswith("xrpl."):
+                raise ImportError("No module named 'xrpl'")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=fake_import), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("xrpl-py", str(ctx.exception))
+
+    @patch.dict(os.environ, {**PAY_ENV, "XRPL_SECRET": "not-a-real-seed"}, clear=True)
+    @patch("xrpcli.load_requests")
+    def test_reports_invalid_secret(self, mock_load_requests):
+        mock_load_requests.return_value = {"abc123": self.make_paid_entry()}
+
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", side_effect=ValueError("bad checksum")
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("invalid XRPL_SECRET", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_requests")
+    def test_rejects_wallet_that_did_not_receive_the_original_payment(
+        self, mock_load_requests
+    ):
+        mock_load_requests.return_value = {
+            "abc123": self.make_paid_entry(address="rSomeMerchant")
+        }
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", return_value=mock_wallet
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("rPayerAddress", str(ctx.exception))
+        self.assertIn("rSomeMerchant", str(ctx.exception))
+
+    @patch.dict(os.environ, {"XRPL_SECRET": "sEdTest"}, clear=True)
+    @patch("xrpcli.load_requests")
+    def test_requires_veriff_credentials_env_vars(self, mock_load_requests):
+        mock_load_requests.return_value = {"abc123": self.make_paid_entry()}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        with patch(
+            "xrpl.wallet.Wallet.from_seed", return_value=mock_wallet
+        ), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("VERIFF_API_KEY", str(ctx.exception))
+        self.assertIn("VERIFF_SHARED_SECRET", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    def test_reports_submission_failure(self, mock_load_verifications):
+        with patch("xrpcli.load_requests", return_value={"abc123": self.make_paid_entry()}):
+            mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+            with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+                "xrpl.transaction.submit_and_wait",
+                side_effect=Exception("connection refused"),
+            ), patch("xrpl.clients.JsonRpcClient"), self.assertRaises(SystemExit) as ctx:
+                xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("refund submission failed", str(ctx.exception))
+        self.assertIn("connection refused", str(ctx.exception))
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_does_not_mark_refunded_when_result_is_not_success(
+        self, mock_load_requests, mock_save_requests, mock_load_verifications
+    ):
+        entry = self.make_paid_entry()
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        mock_response = unittest.mock.Mock()
+        mock_response.result = {
+            "meta": {"TransactionResult": "tecUNFUNDED_PAYMENT"},
+            "hash": "TXHASH123",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait", return_value=mock_response
+        ), patch("xrpl.clients.JsonRpcClient"), self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("tecUNFUNDED_PAYMENT", str(ctx.exception))
+        self.assertEqual(entry["status"], "paid")
+        mock_save_requests.assert_not_called()
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_submits_refund_and_marks_request_refunded_on_success(
+        self, mock_load_requests, mock_save_requests, mock_load_verifications
+    ):
+        entry = self.make_paid_entry()
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        mock_response = unittest.mock.Mock()
+        mock_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "REFUNDTXHASH",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait", return_value=mock_response
+        ) as mock_submit, patch("xrpl.clients.JsonRpcClient"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                xrpcli.cmd_refund(make_refund_args())
+
+        self.assertIn("REFUNDTXHASH", buf.getvalue())
+
+        sent_payment = mock_submit.call_args[0][0]
+        self.assertEqual(sent_payment.account, "rPayerAddress")
+        self.assertEqual(sent_payment.destination, VALID_ADDRESS)
+        self.assertEqual(sent_payment.amount, "5000000")
+
+        self.assertEqual(entry["status"], "refunded")
+        self.assertEqual(entry["refund_tx_hash"], "REFUNDTXHASH")
+        self.assertIn("refunded_at", entry)
+        # The original paid tx_hash is left intact alongside the refund.
+        self.assertEqual(entry["tx_hash"], "ORIGINALTXHASH")
+        mock_save_requests.assert_called_once()
+
+    @patch.dict(os.environ, PAY_ENV, clear=True)
+    @patch("xrpcli.load_verifications", return_value=APPROVED_VERIFICATION_STORE)
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests")
+    def test_refunds_stablecoin_request_as_issued_currency(
+        self, mock_load_requests, mock_save_requests, mock_load_verifications
+    ):
+        entry = self.make_paid_entry(currency="USDC", amount="25")
+        mock_load_requests.return_value = {"abc123": entry}
+
+        mock_wallet = unittest.mock.Mock(address="rPayerAddress")
+        mock_response = unittest.mock.Mock()
+        mock_response.result = {
+            "meta": {"TransactionResult": "tesSUCCESS"},
+            "hash": "REFUNDTXHASH",
+        }
+
+        with patch("xrpl.wallet.Wallet.from_seed", return_value=mock_wallet), patch(
+            "xrpl.transaction.submit_and_wait", return_value=mock_response
+        ) as mock_submit, patch("xrpl.clients.JsonRpcClient"):
+            xrpcli.cmd_refund(make_refund_args())
+
+        sent_payment = mock_submit.call_args[0][0]
+        self.assertEqual(sent_payment.amount.currency, xrpcli.STABLECOINS["USDC"]["currency"])
+        self.assertEqual(sent_payment.amount.issuer, xrpcli.STABLECOINS["USDC"]["issuers"]["mainnet"])
+        self.assertEqual(sent_payment.amount.value, "25")
+        self.assertEqual(entry["status"], "refunded")
+
+
 class CmdSendStablecoinTests(unittest.TestCase):
     def test_rejects_invalid_destination_address(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -2050,6 +2291,26 @@ class CmdCheckTests(unittest.TestCase):
         self.assertIn("already marked paid", buf.getvalue())
         self.assertIn("DEADBEEF", buf.getvalue())
         mock_rpc_call.assert_not_called()
+
+    @patch("xrpcli.rpc_call")
+    @patch("xrpcli.load_requests")
+    def test_reports_refunded_without_network_call_or_remarking_paid(
+        self, mock_load_requests, mock_rpc_call
+    ):
+        entry = self.make_pending_entry(
+            status="refunded", tx_hash="DEADBEEF", refund_tx_hash="REFUNDHASH"
+        )
+        mock_load_requests.return_value = {"abc123": entry}
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_check(make_check_args())
+
+        self.assertIn("refunded", buf.getvalue())
+        self.assertIn("REFUNDHASH", buf.getvalue())
+        mock_rpc_call.assert_not_called()
+        # Must not have been re-scanned and flipped back to "paid".
+        self.assertEqual(entry["status"], "refunded")
 
     @patch("xrpcli.save_requests")
     @patch("xrpcli.rpc_call")

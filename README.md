@@ -954,6 +954,95 @@ main payment (asserted against `STABLECOINS`' real currency code/issuer)
 while the platform fee is computed from the USDC amount directly (not
 multiplied by the XRP/USD rate) and still paid in XRP.
 
+### refund
+
+Refund a `paid` request back to whoever paid it: looks it up, confirms
+`XRPL_SECRET` belongs to the wallet that actually *received* the original
+payment, confirms that wallet has completed [identity
+verification](#identity-verification) (the same gate `pay` uses — a wallet
+that's already verified doesn't need to verify again), then signs and
+submits a `Payment` for the exact original amount and currency back to the
+address recorded as `paid_by`. This one **moves real funds** and requires
+the `xrpl-py` package, same as `pay`.
+
+```
+python xrpcli.py refund <request-id>
+```
+
+- `request-id` — the ID printed by `xrpcli.py request` (must currently be `paid`)
+
+Only a full refund of the exact paid amount is supported — there's no
+partial-amount option. **The platform fee already collected on the
+original payment is not refunded by this command**: it was paid by the
+customer as a separate transaction straight to `PLATFORM_FEE_ADDRESS`, and
+reversing it would require signing from that wallet, which the merchant
+running `refund` doesn't hold the secret for. Recovering a collected
+platform fee is between the customer and the platform operator, outside
+this tool.
+
+**Request status tracking:** `refund` reads the same `requests.json` entry
+that `request` creates and `pay`/`check` settle. On success it updates the
+entry in place — leaving the original `tx_hash`/`paid_by` untouched — and
+sets a new `status`:
+
+```json
+{
+  "status": "refunded",
+  "tx_hash": "B3737CEDEC9839126D98638E1478330AD9347E38A54ED184DDBC52A84A03435F",
+  "paid_by": "rBFnFXTjvVwp4ar9bYpy9ojcYLgP7bcsha",
+  "paid_at": "2026-08-17T04:04:10.462975+00:00",
+  "refund_tx_hash": "F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A0B1C2D3E4F5A6B7C8D9E0F1A2",
+  "refunded_at": "2026-09-04T12:00:00.000000+00:00"
+}
+```
+
+`"status": "refunded"` is terminal, same way `"paid"` is final for a
+never-paid request: `pay` refuses to pay a refunded request (`error:
+request '<id>' was already paid and refunded`), and `check` reports it's
+been refunded without ever re-scanning the ledger — important because the
+*original* payment is still sitting there on-chain with `tesSUCCESS`, and
+without this guard `check` would otherwise find it again and flip the
+request back to `"paid"`, erasing the refund.
+
+**Error handling:** checked in order, before ever attempting to sign or submit anything:
+
+1. **Unknown request ID** — `error: no payment request found with id '<id>'`
+2. **Already refunded** — `error: request '<id>' was already refunded (tx hash=<hash>)`
+3. **Not yet paid** — `error: request '<id>' has not been paid yet, nothing to refund`
+   (covers both a `pending` request and any other non-`paid` status)
+4. **Missing `XRPL_SECRET`** — `error: set the XRPL_SECRET environment
+   variable to the wallet's secret (seed) that received the payment before
+   refunding`
+5. **`xrpl-py` not installed** / **invalid secret** — same errors as `pay`
+6. **Wrong wallet** — `error: XRPL_SECRET belongs to <address>, but this
+   request was paid to <merchant-address> -- a refund must be signed by
+   the wallet that received the original payment`
+7. **Missing Veriff credentials / wallet not yet verified** — same errors
+   as [`pay`](#identity-verification), gating on the refunding wallet's
+   own address
+
+Once past all of that, submission failures are surfaced the same way as
+`pay`: `error: refund submission failed: <reason>` for an unreachable node
+or failed submission, and `error: refund failed with result '<code>'` for
+a submitted-but-not-`tesSUCCESS` result — in both cases the request is
+left `paid` (not `refunded`), so `refund` can simply be retried.
+
+**Tests:** `tests/test_xrpcli.py::CmdRefundTests` covers `refund` end to
+end without ever touching the real network or moving funds (the request
+store and `xrpl-py`'s `Wallet`/`submit_and_wait`/`JsonRpcClient` are all
+mocked, same as `CmdPayTests`). It checks every case listed under "Error
+handling" above, plus the success path: a successful refund submits a
+`Payment` from the merchant's wallet to the recorded `paid_by` address for
+the exact original amount, prints the refund's tx hash, and updates the
+entry's `status`/`refund_tx_hash`/`refunded_at` while leaving the original
+`tx_hash` intact; a stablecoin-denominated request (`"currency": "USDC"`)
+refunds as an `IssuedCurrencyAmount` using that stablecoin's real currency
+code/issuer; and a non-`tesSUCCESS` result leaves the request `paid`
+without saving. `CmdPayTests::test_rejects_refunded_request` and
+`CmdCheckTests::test_reports_refunded_without_network_call_or_remarking_paid`
+cover the guards in `pay`/`check` that a refunded request must never be
+paid again or silently flipped back to `paid` by a re-scan.
+
 ### send-stablecoin
 
 Send USDC or RLUSD directly from your wallet to another address — a
