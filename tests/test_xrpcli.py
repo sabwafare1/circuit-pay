@@ -1019,6 +1019,62 @@ class CmdRequestTests(unittest.TestCase):
         self.assertEqual(len(saved), 2)
         self.assertIn("aaaaaaaa", saved)
 
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_prints_scannable_ascii_qr_code_for_the_payment_uri(
+        self, mock_load_requests, mock_save_requests
+    ):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_request(make_request_args(amount="12.5", tag=777))
+
+        output = buf.getvalue()
+        self.assertIn("Or have them scan this to pay:", output)
+        self.assertIn("##", output)
+
+    @patch("xrpcli.save_requests")
+    @patch("xrpcli.load_requests", return_value={})
+    def test_prints_install_hint_instead_of_crashing_when_qrcode_not_installed(
+        self, mock_load_requests, mock_save_requests
+    ):
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "qrcode":
+                raise ImportError("No module named 'qrcode'")
+            return real_import(name, *args, **kwargs)
+
+        buf = io.StringIO()
+        with patch("builtins.__import__", side_effect=fake_import), contextlib.redirect_stdout(buf):
+            xrpcli.cmd_request(make_request_args(amount="12.5", tag=777))
+
+        output = buf.getvalue()
+        self.assertIn("pip install qrcode", output)
+        self.assertNotIn("Or have them scan this to pay:", output)
+        # The request itself still succeeds even without the optional dependency.
+        mock_save_requests.assert_called_once()
+
+
+class RenderQrAsciiTests(unittest.TestCase):
+    def test_renders_a_grid_of_two_char_wide_modules(self):
+        art = xrpcli.render_qr_ascii("ripple:rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh?amount=5&dt=1")
+
+        lines = art.split("\n")
+        self.assertGreater(len(lines), 0)
+        for line in lines:
+            self.assertEqual(len(line) % 2, 0)
+            chunks = [line[i : i + 2] for i in range(0, len(line), 2)]
+            self.assertTrue(all(chunk in ("##", "  ") for chunk in chunks))
+        # A real QR code has both dark and light modules.
+        self.assertIn("##", art)
+        self.assertIn("  ", art)
+
+    def test_different_data_produces_different_codes(self):
+        art_a = xrpcli.render_qr_ascii("ripple:rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh?amount=5&dt=1")
+        art_b = xrpcli.render_qr_ascii("ripple:rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh?amount=50&dt=2")
+
+        self.assertNotEqual(art_a, art_b)
+
 
 class CmdPayTests(unittest.TestCase):
     @patch("xrpcli.load_requests", return_value={})

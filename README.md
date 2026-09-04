@@ -292,8 +292,8 @@ $ python xrpcli.py convert 50 usd
 ### request
 
 Create a payment request for an exact amount plus a note. Prints a request
-ID, a shareable `ripple:` payment URI (paste it into a wallet, or turn it
-into a QR code), and an unsigned `Payment` transaction template that a
+ID, a shareable `ripple:` payment URI, a scannable QR code rendered right
+in the terminal, and an unsigned `Payment` transaction template that a
 customer's wallet or tool can use to send that exact payment. The request
 is also saved locally (see `pay` below) so it can be looked up and settled
 by its ID. Creating the request itself runs entirely offline — no network
@@ -312,6 +312,16 @@ python xrpcli.py request <address> <amount> [--note TEXT] [--tag N] [--network m
 - `--network` — which XRPL network the request should be paid on (default: `mainnet`)
 - `--type` — `p2p` or `merchant` (default: `p2p`); which [platform fee](#platform-fees)
   applies when this request is paid
+
+**QR code:** `request` renders the same `ripple:` URI as a plain-ASCII QR
+code printed straight to the terminal (via the optional `qrcode` package
+in `requirements.txt`), so a customer can scan it off the screen without
+needing the URI typed or pasted anywhere. It's rendered with `#`/space
+characters rather than `qrcode`'s own Unicode block art, since that
+garbles on a Windows console stuck on a non-UTF-8 codepage. If `qrcode`
+isn't installed, `request` still works — everything else it prints is
+pure standard library — and just prints a one-line hint to install it
+instead of the QR block.
 
 **Request status tracking:** on success, `request` generates a short
 random ID (8 hex characters, e.g. `9cc8e589`) that doesn't collide with
@@ -358,8 +368,14 @@ amount, tag, note, and `pending` status; omitting `--note` leaves out the
 memo/URI param and the printed "Note:" line; an omitted `--tag` falls back
 to a (mocked, deterministic) random tag; a newly generated request ID
 never collides with one already present in the store; `--type` defaults to
-`p2p` and prints/persists the flat-fee description; and `--type merchant`
-prints/persists the percentage-fee description instead.
+`p2p` and prints/persists the flat-fee description; `--type merchant`
+prints/persists the percentage-fee description instead; a QR code is
+printed for the payment URI; and (simulating `qrcode` missing via a
+patched `builtins.__import__`) the request still succeeds and prints an
+install hint instead of crashing. `tests/test_xrpcli.py::RenderQrAsciiTests`
+covers `render_qr_ascii` directly: every printed row is made up only of the
+two 2-character tokens it uses for dark/light modules, the rendered grid
+contains both, and different input data produces a different grid.
 
 Live example (run for real against the local request store — `request`
 itself makes no network call, but the request ID below is genuinely
@@ -368,16 +384,56 @@ generated, not a placeholder):
 ```
 $ python xrpcli.py request rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh 12.5 --note "Invoice #42" --tag 777
 Payment request created:
-  Request ID:       894bc8a7
+  Request ID:       97b89188
   Pay to:           rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
   Amount:           12.5 XRP (12500000 drops)
   Destination tag:  777
   Note:             Invoice #42
+  Fee type:         p2p (flat $0.10 fee)
 
-The customer can pay it directly with: xrpcli.py pay 894bc8a7
+The customer can pay it directly with: xrpcli.py pay 97b89188
 
-Or give them this to pay manually (paste into a wallet, or turn into a QR code):
+Or give them this to pay manually (paste into a wallet):
   ripple:rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh?amount=12.5&dt=777&memo=Invoice+%2342
+
+Or have them scan this to pay:
+        ##############  ########    ####  ##    ######          ##  ##############
+        ##          ##  ####    ####  ##      ########    ####  ##  ##          ##
+        ##  ######  ##  ####  ####  ######  ##    ##    ######      ##  ######  ##
+        ##  ######  ##    ####  ##  ##  ####      ##  ##            ##  ######  ##
+        ##  ######  ##  ##    ####  ##############    ##    ##  ##  ##  ######  ##
+        ##          ##    ##    ##  ####    ##  ####  ########      ##          ##
+        ##############  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##  ##############
+                          ##    ##  ##                ######  ####
+        ##    ############  ####  ################      ##    ##  ##    ##  ######
+            ####      ####  ####  ####        ######          ####      ####  ##
+        ##  ##  ######  ######  ######      ##      ####  ##########        ##  ##
+        ##    ####          ##        ##  ####  ##  ####          ####    ####  ##
+              ####  ######    ########        ####  ##      ##      ######    ##
+            ##    ##  ####      ##    ##      ##    ##    ##    ##      ##
+                  ######    ##      ######    ####      ##  ####  ##  ############
+          ##    ####        ##  ######  ##  ######  ####        ##      ##########
+            ##  ########    ####  ####  ##  ######  ####  ##############    ##
+        ##      ##          ######      ####  ##  ####  ##    ####        ######
+        ####      ####  ##        ##  ##      ##  ######  ##  ########  ##  ##  ##
+        ##########      ##########              ##  ####  ####  ##    ######
+        ##      ##  ##    ####    ##########        ####    ######  ##  ####    ##
+        ##    ##  ##    ##  ######    ##    ####  ##              ##  ####  ##
+        ####  ##    ####    ##  ##  ####    ##      ####  ##  ##    ##    ##    ##
+          ##      ##    ##  ##      ##    ####  ##    ####    ####  ##  ######  ##
+        ##    ##########  ####  ##    ############    ####        ####    ##  ####
+        ####  ##      ##  ####  ##  ##  ##  ##  ##    ##  ########    ##########
+        ####  ##########      ##  ##    ##    ####            ####        ##  ####
+        ##                ##  ##    ####    ##      ##      ##    ######  ######
+        ##  ####    ##          ##  ##  ##        ####    ##  ############  ##
+                        ##  ##  ##            ########  ####    ##      ####  ##
+        ##############  ####    ####  ##      ##  ######  ##  ####  ##  ######  ##
+        ##          ##  ######    ##      ####  ##  ##  ####  ####      ####  ##
+        ##  ######  ##  ####  ########                ####  ################  ##
+        ##  ######  ##  ##  ##########  ##  ####    ####  ######  ######  ####  ##
+        ##  ######  ##    ######  ##  ######      ######  ######  ####  ####    ##
+        ##          ##        ####  ##  ########    ####            ####    ######
+        ##############  ##    ######  ##      ####    ##    ##  ####    ##      ##
 
 Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):
 {
@@ -397,14 +453,15 @@ Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):
 
 $ cat requests.json
 {
-  "894bc8a7": {
+  "97b89188": {
     "address": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
     "amount": "12.5",
     "tag": 777,
     "note": "Invoice #42",
     "network": "mainnet",
+    "fee_type": "p2p",
     "status": "pending",
-    "created_at": "2026-08-17T04:27:10.961795+00:00"
+    "created_at": "2026-09-04T05:46:49.147387+00:00"
   }
 }
 ```

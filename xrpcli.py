@@ -165,6 +165,21 @@ def build_payment_uri(address, amount_str, tag, note):
     return f"ripple:{address}?{urllib.parse.urlencode(params)}"
 
 
+def render_qr_ascii(data):
+    # Plain ASCII rather than qrcode's own Unicode half-block renderer, since
+    # that garbles on a Windows console stuck on a non-UTF-8 codepage. Each
+    # module prints two characters wide to look roughly square in a
+    # monospace terminal, since terminal glyphs are taller than they are wide.
+    import qrcode
+
+    qr = qrcode.QRCode()
+    qr.add_data(data)
+    qr.make(fit=True)
+    return "\n".join(
+        "".join("##" if module else "  " for module in row) for row in qr.get_matrix()
+    )
+
+
 def load_requests():
     if not os.path.exists(REQUESTS_FILE):
         return {}
@@ -532,8 +547,16 @@ def cmd_request(args):
     print()
     print(f"The customer can pay it directly with: xrpcli.py pay {request_id}")
     print()
-    print("Or give them this to pay manually (paste into a wallet, or turn into a QR code):")
+    print("Or give them this to pay manually (paste into a wallet):")
     print(f"  {uri}")
+    print()
+    try:
+        qr_ascii = render_qr_ascii(uri)
+    except ImportError:
+        print("(install the 'qrcode' package to also print a scannable QR code here: pip install qrcode)")
+    else:
+        print("Or have them scan this to pay:")
+        print(qr_ascii)
     print()
     print("Unsigned transaction (for wallets/tools that accept raw XRPL tx JSON):")
     print(json.dumps(tx_template, indent=2))

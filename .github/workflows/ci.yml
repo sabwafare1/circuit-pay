@@ -36,3 +36,6 @@ jobs:
 
       - name: Stablecoins command smoke test
         run: python xrpcli.py stablecoins --help
+
+      - name: Send-stablecoin command smoke test
+        run: python xrpcli.py send-stablecoin --help
