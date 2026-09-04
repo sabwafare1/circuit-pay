@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import secrets
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -950,6 +951,60 @@ def cmd_send_stablecoin(args):
     print(f"Payment sent and validated. tx hash={tx_hash}")
 
 
+def build_amount_matcher(entry):
+    currency = entry.get("currency", "XRP")
+    network = entry.get("network", "mainnet")
+
+    if currency == "XRP":
+        expected_drops = xrp_to_drops(entry["amount"])
+
+        def amount_matches(tx_amount):
+            return tx_amount == str(expected_drops)
+    else:
+        _, currency_code, issuer = resolve_stablecoin(currency, network)
+
+        def amount_matches(tx_amount):
+            return (
+                isinstance(tx_amount, dict)
+                and tx_amount.get("currency") == currency_code
+                and tx_amount.get("issuer") == issuer
+                and decimal.Decimal(tx_amount.get("value", "0")) == decimal.Decimal(entry["amount"])
+            )
+
+    return amount_matches
+
+
+def find_matching_payment(entry, transactions):
+    amount_matches = build_amount_matcher(entry)
+
+    for tx_entry in transactions:
+        tx = tx_entry.get("tx", {})
+        meta = tx_entry.get("meta", {})
+        tx_result = meta.get("TransactionResult") if isinstance(meta, dict) else None
+
+        if tx.get("TransactionType") != "Payment":
+            continue
+        if tx_result != "tesSUCCESS":
+            continue
+        if tx.get("Destination") != entry["address"]:
+            continue
+        if tx.get("DestinationTag") != entry.get("tag"):
+            continue
+        if not amount_matches(tx.get("Amount")):
+            continue
+        return tx
+
+    return None
+
+
+def mark_request_paid_from_tx(entry, tx):
+    entry["status"] = "paid"
+    entry["tx_hash"] = tx.get("hash")
+    entry["paid_by"] = tx.get("Account")
+    entry["paid_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    entry["verified_via"] = "check"
+
+
 def cmd_check(args):
     requests_store = load_requests()
     entry = requests_store.get(args.request_id)
@@ -974,22 +1029,6 @@ def cmd_check(args):
     network = entry.get("network", "mainnet")
     endpoint = NETWORKS[network]
 
-    if currency == "XRP":
-        expected_drops = xrp_to_drops(entry["amount"])
-
-        def amount_matches(tx_amount):
-            return tx_amount == str(expected_drops)
-    else:
-        _, currency_code, issuer = resolve_stablecoin(currency, network)
-
-        def amount_matches(tx_amount):
-            return (
-                isinstance(tx_amount, dict)
-                and tx_amount.get("currency") == currency_code
-                and tx_amount.get("issuer") == issuer
-                and decimal.Decimal(tx_amount.get("value", "0")) == decimal.Decimal(entry["amount"])
-            )
-
     result = rpc_call(
         endpoint,
         "account_tx",
@@ -1005,27 +1044,9 @@ def cmd_check(args):
         error = RPC_ERROR_MESSAGES.get(code) or result.get("error_message") or code or "unknown error"
         raise SystemExit(f"error: {error}")
 
-    for tx_entry in result.get("transactions", []):
-        tx = tx_entry.get("tx", {})
-        meta = tx_entry.get("meta", {})
-        tx_result = meta.get("TransactionResult") if isinstance(meta, dict) else None
-
-        if tx.get("TransactionType") != "Payment":
-            continue
-        if tx_result != "tesSUCCESS":
-            continue
-        if tx.get("Destination") != entry["address"]:
-            continue
-        if tx.get("DestinationTag") != entry.get("tag"):
-            continue
-        if not amount_matches(tx.get("Amount")):
-            continue
-
-        entry["status"] = "paid"
-        entry["tx_hash"] = tx.get("hash")
-        entry["paid_by"] = tx.get("Account")
-        entry["paid_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        entry["verified_via"] = "check"
+    tx = find_matching_payment(entry, result.get("transactions", []))
+    if tx is not None:
+        mark_request_paid_from_tx(entry, tx)
         save_requests(requests_store)
 
         print(f"Match found - request '{args.request_id}' is now marked paid.")
@@ -1038,6 +1059,83 @@ def cmd_check(args):
         f"({entry['amount']} {currency} to {entry['address']} with tag {entry.get('tag')} "
         f"on {network})."
     )
+
+
+def run_watch_pass(requests_store, network_filter, limit):
+    pending = [
+        (request_id, entry)
+        for request_id, entry in requests_store.items()
+        if entry.get("status") == "pending"
+        and (network_filter is None or entry.get("network", "mainnet") == network_filter)
+    ]
+
+    groups = {}
+    for request_id, entry in pending:
+        key = (entry["address"], entry.get("network", "mainnet"))
+        groups.setdefault(key, []).append((request_id, entry))
+
+    matched = 0
+    for (address, network), items in groups.items():
+        endpoint = NETWORKS[network]
+        try:
+            result = rpc_call(
+                endpoint,
+                "account_tx",
+                {"account": address, "limit": limit, "binary": False},
+            )["result"]
+        except SystemExit as e:
+            # One unreachable network shouldn't stop reconciliation of
+            # pending requests on other networks in the same pass.
+            print(f"error: failed to scan {address} on {network}: {e}")
+            continue
+
+        if result.get("status") != "success":
+            code = result.get("error")
+            error = RPC_ERROR_MESSAGES.get(code) or result.get("error_message") or code or "unknown error"
+            print(f"error: failed to scan {address} on {network}: {error}")
+            continue
+
+        transactions = result.get("transactions", [])
+        for request_id, entry in items:
+            tx = find_matching_payment(entry, transactions)
+            if tx is None:
+                continue
+            mark_request_paid_from_tx(entry, tx)
+            matched += 1
+            print(f"Match found - request '{request_id}' is now marked paid.")
+            print(f"  tx hash: {tx.get('hash')}")
+            print(f"  paid by: {tx.get('Account')}")
+
+    if matched:
+        save_requests(requests_store)
+
+    return len(pending), matched
+
+
+def cmd_watch(args):
+    if args.interval is not None and args.interval < 5:
+        raise SystemExit("error: --interval must be at least 5 seconds")
+
+    try:
+        while True:
+            requests_store = load_requests()
+            checked, matched = run_watch_pass(requests_store, args.network, args.limit)
+
+            if checked == 0:
+                print("No pending requests to check.")
+            else:
+                noun = "request" if checked == 1 else "requests"
+                print(
+                    f"Checked {checked} pending {noun}: {matched} newly marked paid, "
+                    f"{checked - matched} still pending."
+                )
+
+            if args.interval is None:
+                return
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
 
 
 def build_parser():
@@ -1193,6 +1291,33 @@ def build_parser():
         help="how many recent transactions on the merchant's account to scan (default: 50)",
     )
     check.set_defaults(func=cmd_check)
+
+    watch = subparsers.add_parser(
+        "watch",
+        help="reconcile all pending requests against the ledger, once or on a loop",
+    )
+    watch.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        help=(
+            "seconds between passes; omit to run a single pass and exit "
+            "(e.g. for cron/Task Scheduler). Minimum 5 seconds."
+        ),
+    )
+    watch.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="how many recent transactions to scan per address per pass (default: 50)",
+    )
+    watch.add_argument(
+        "--network",
+        choices=NETWORKS.keys(),
+        default=None,
+        help="only watch pending requests on this network (default: all networks)",
+    )
+    watch.set_defaults(func=cmd_watch)
 
     return parser
 

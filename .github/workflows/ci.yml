@@ -42,3 +42,6 @@ jobs:
 
       - name: Refund command smoke test
         run: python xrpcli.py refund --help
+
+      - name: Watch command smoke test
+        run: python xrpcli.py watch --help

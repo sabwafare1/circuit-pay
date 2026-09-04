@@ -90,6 +90,10 @@ def make_check_args(request_id="abc123", limit=50):
     return argparse.Namespace(request_id=request_id, limit=limit)
 
 
+def make_watch_args(interval=None, limit=50, network=None):
+    return argparse.Namespace(interval=interval, limit=limit, network=network)
+
+
 def make_account_tx_entry(
     tx_type="Payment",
     result="tesSUCCESS",
@@ -2572,6 +2576,187 @@ class CmdCheckTests(unittest.TestCase):
         self.assertIn("No matching payment found yet", buf.getvalue())
         self.assertEqual(entry["status"], "pending")
         mock_save_requests.assert_not_called()
+
+
+class RunWatchPassTests(unittest.TestCase):
+    def test_groups_pending_requests_by_address_and_network_one_rpc_call_each(self):
+        requests_store = {
+            "r1": {
+                "status": "pending", "address": "rMerchantA", "network": "mainnet",
+                "amount": "5", "currency": "XRP", "tag": 1,
+            },
+            "r2": {
+                "status": "pending", "address": "rMerchantA", "network": "mainnet",
+                "amount": "10", "currency": "XRP", "tag": 2,
+            },
+            "r3": {
+                "status": "pending", "address": "rMerchantB", "network": "testnet",
+                "amount": "3", "currency": "XRP", "tag": 3,
+            },
+            "r4": {
+                "status": "paid", "address": "rMerchantA", "network": "mainnet",
+                "amount": "1", "currency": "XRP", "tag": 9,
+            },
+        }
+
+        call_accounts = []
+
+        def fake_rpc_call(endpoint, method, params):
+            call_accounts.append(params["account"])
+            return {"result": {"status": "success", "transactions": []}}
+
+        with patch("xrpcli.rpc_call", side_effect=fake_rpc_call):
+            checked, matched = xrpcli.run_watch_pass(requests_store, None, 50)
+
+        # r4 is already "paid" and excluded from the pending count.
+        self.assertEqual(checked, 3)
+        self.assertEqual(matched, 0)
+        # One rpc_call per (address, network) group, not one per pending request.
+        self.assertEqual(sorted(call_accounts), ["rMerchantA", "rMerchantB"])
+
+    @patch("xrpcli.save_requests")
+    def test_marks_matching_requests_paid_and_saves_once(self, mock_save_requests):
+        entry1 = {
+            "status": "pending", "address": VALID_ADDRESS, "network": "mainnet",
+            "amount": "5", "currency": "XRP", "tag": 1,
+        }
+        entry2 = {
+            "status": "pending", "address": VALID_ADDRESS, "network": "mainnet",
+            "amount": "10", "currency": "XRP", "tag": 2,
+        }
+        requests_store = {"r1": entry1, "r2": entry2}
+
+        matching_tx = make_account_tx_entry(
+            destination_tag=1, amount="5000000", tx_hash="HASH1", account="rPayer1"
+        )
+
+        with patch(
+            "xrpcli.rpc_call",
+            return_value={"result": {"status": "success", "transactions": [matching_tx]}},
+        ):
+            checked, matched = xrpcli.run_watch_pass(requests_store, None, 50)
+
+        self.assertEqual((checked, matched), (2, 1))
+        self.assertEqual(entry1["status"], "paid")
+        self.assertEqual(entry1["tx_hash"], "HASH1")
+        self.assertEqual(entry1["paid_by"], "rPayer1")
+        self.assertEqual(entry2["status"], "pending")
+        mock_save_requests.assert_called_once()
+
+    @patch("xrpcli.save_requests")
+    def test_does_not_save_when_nothing_matches(self, mock_save_requests):
+        entry = {
+            "status": "pending", "address": VALID_ADDRESS, "network": "mainnet",
+            "amount": "5", "currency": "XRP", "tag": 1,
+        }
+        requests_store = {"r1": entry}
+
+        with patch(
+            "xrpcli.rpc_call",
+            return_value={"result": {"status": "success", "transactions": []}},
+        ):
+            checked, matched = xrpcli.run_watch_pass(requests_store, None, 50)
+
+        self.assertEqual((checked, matched), (1, 0))
+        mock_save_requests.assert_not_called()
+
+    def test_filters_by_network(self):
+        requests_store = {
+            "r1": {
+                "status": "pending", "address": "rA", "network": "mainnet",
+                "amount": "5", "currency": "XRP", "tag": 1,
+            },
+            "r2": {
+                "status": "pending", "address": "rB", "network": "testnet",
+                "amount": "5", "currency": "XRP", "tag": 2,
+            },
+        }
+
+        with patch(
+            "xrpcli.rpc_call",
+            return_value={"result": {"status": "success", "transactions": []}},
+        ) as mock_rpc:
+            checked, matched = xrpcli.run_watch_pass(requests_store, "testnet", 50)
+
+        self.assertEqual((checked, matched), (1, 0))
+        mock_rpc.assert_called_once()
+        self.assertEqual(mock_rpc.call_args[0][2]["account"], "rB")
+
+    @patch("xrpcli.save_requests")
+    def test_continues_past_a_group_with_an_unreachable_network(self, mock_save_requests):
+        requests_store = {
+            "r1": {
+                "status": "pending", "address": "rBad", "network": "mainnet",
+                "amount": "5", "currency": "XRP", "tag": 1,
+            },
+            "r2": {
+                "status": "pending", "address": "rGood", "network": "testnet",
+                "amount": "5", "currency": "XRP", "tag": 2,
+            },
+        }
+
+        matching_tx = make_account_tx_entry(
+            destination="rGood", destination_tag=2, amount="5000000", account="rPayer2"
+        )
+
+        def fake_rpc_call(endpoint, method, params):
+            if params["account"] == "rBad":
+                raise SystemExit("error: failed to reach endpoint: connection refused")
+            return {"result": {"status": "success", "transactions": [matching_tx]}}
+
+        buf = io.StringIO()
+        with patch("xrpcli.rpc_call", side_effect=fake_rpc_call), contextlib.redirect_stdout(buf):
+            checked, matched = xrpcli.run_watch_pass(requests_store, None, 50)
+
+        self.assertEqual((checked, matched), (2, 1))
+        self.assertIn("failed to scan rBad", buf.getvalue())
+        self.assertEqual(requests_store["r2"]["status"], "paid")
+        mock_save_requests.assert_called_once()
+
+
+class CmdWatchTests(unittest.TestCase):
+    def test_rejects_interval_below_minimum(self):
+        with self.assertRaises(SystemExit) as ctx:
+            xrpcli.cmd_watch(make_watch_args(interval=1))
+
+        self.assertIn("--interval must be at least 5 seconds", str(ctx.exception))
+
+    @patch("xrpcli.load_requests", return_value={})
+    def test_single_pass_reports_no_pending_requests(self, mock_load_requests):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_watch(make_watch_args())
+
+        self.assertIn("No pending requests to check.", buf.getvalue())
+
+    @patch("xrpcli.run_watch_pass", return_value=(3, 1))
+    @patch("xrpcli.load_requests", return_value={})
+    def test_single_pass_prints_summary_and_returns(self, mock_load_requests, mock_run_pass):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_watch(make_watch_args())
+
+        self.assertIn(
+            "Checked 3 pending requests: 1 newly marked paid, 2 still pending.",
+            buf.getvalue(),
+        )
+        mock_run_pass.assert_called_once()
+
+    @patch("time.sleep")
+    @patch("xrpcli.run_watch_pass", return_value=(0, 0))
+    @patch("xrpcli.load_requests", return_value={})
+    def test_loops_with_interval_reloading_each_pass_until_interrupted(
+        self, mock_load_requests, mock_run_pass, mock_sleep
+    ):
+        mock_sleep.side_effect = [None, None, KeyboardInterrupt()]
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            xrpcli.cmd_watch(make_watch_args(interval=5))
+
+        self.assertEqual(mock_run_pass.call_count, 3)
+        self.assertEqual(mock_load_requests.call_count, 3)
+        self.assertIn("Stopped watching.", buf.getvalue())
 
 
 if __name__ == "__main__":

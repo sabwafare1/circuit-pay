@@ -1258,3 +1258,86 @@ stablecoin example above, run for real against testnet):
 $ python xrpcli.py check 9ab638c6
 No matching payment found yet for request '9ab638c6' (25 USDC to rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh with tag 888 on testnet).
 ```
+
+### watch
+
+Automate `check` across every `pending` request instead of running it one
+request ID at a time. This is what closes the gap `check` itself leaves
+open: most real customers pay by scanning the `ripple:` QR code from their
+own wallet, and someone still has to remember to run `check` afterward —
+`watch` is that "someone," either once (for a scheduler) or continuously
+(left running in a terminal).
+
+```
+python xrpcli.py watch [--interval N] [--limit N] [--network mainnet|testnet|devnet]
+```
+
+- `--interval` — seconds between passes; **omit it to run exactly one pass
+  and exit** (intended for cron / Windows Task Scheduler — `watch` itself
+  has no persistence or scheduling of its own). If given, `watch` loops
+  with a `time.sleep(N)` between passes until interrupted (Ctrl+C prints
+  `Stopped watching.` and exits cleanly rather than a traceback). Minimum
+  `5` seconds, to avoid hammering a public RPC endpoint.
+- `--limit` — how many recent transactions to scan per merchant address,
+  per pass (default: `50`, same meaning as `check`'s `--limit`)
+- `--network` — only watch pending requests on this network (default: all
+  networks present among pending requests)
+
+**How a pass works:** every `pending` request in `requests.json` is
+grouped by `(address, network)`, and `watch` makes **one** `account_tx`
+call per group rather than one per request — a merchant with several
+outstanding invoices to the same wallet doesn't multiply the RPC calls.
+Each request in a group is then matched against that one scan using the
+exact same currency-aware matching `check` uses (`xrpcli.find_matching_payment`,
+extracted out of `check` so both commands share one matching path, not two
+that could drift apart). `paid`/`refunded` requests are never included in
+a pass — only `pending` ones.
+
+If one group's `account_tx` call fails (unreachable node, RPC error), that
+failure is printed and that group is skipped — it does **not** abort the
+rest of the pass, since a pending request on `testnet` shouldn't get stuck
+behind an outage on `mainnet` (or vice versa) in the same run. Any newly
+matched requests across all groups are saved once, at the end of the pass.
+
+**Output:** a `Match found` line per newly-paid request (identical to
+`check`'s own), followed by one summary line: `Checked N pending requests:
+M newly marked paid, K still pending.` (or `No pending requests to check.`
+if there weren't any). Exit code is always `0` unless something outside
+the pass itself goes wrong — "nothing matched yet" is not an error, same
+as `check`.
+
+**Tests:** `tests/test_xrpcli.py::RunWatchPassTests` covers the batching
+core directly (no network, `rpc_call` mocked): pending requests sharing an
+address make exactly one `rpc_call`, not one per request; a match updates
+the entry and `save_requests` is called exactly once when anything
+matched (and not at all when nothing did); `--network` filtering excludes
+requests on other networks from both the count and the scan; and a group
+whose `account_tx` call raises is skipped without stopping the rest of the
+pass, including still saving whatever *did* match elsewhere in that pass.
+`tests/test_xrpcli.py::CmdWatchTests` covers the CLI layer: `--interval`
+below 5 is rejected before doing anything; a single pass with nothing
+pending prints the friendly "nothing to check" message and returns; a
+single pass with results prints the summary line; and (mocking `time.sleep`
+to raise `KeyboardInterrupt` on its third call) the loop mode reloads
+`requests.json` fresh on every pass and stops cleanly on interrupt.
+
+Live example (run for real against XRPL testnet with two pending requests
+to the same merchant wallet, one of them paid directly via `xrpl-py`
+in between — independent of `xrpcli.py pay`, simulating a customer paying
+from their own wallet):
+
+```
+$ python xrpcli.py watch
+Checked 2 pending requests: 0 newly marked paid, 2 still pending.
+
+# ...customer pays one of the two requests directly from their own wallet...
+
+$ python xrpcli.py watch
+Match found - request 'b89889a6' is now marked paid.
+  tx hash: 782D5361EA329081621AF17BFAC8798592FD7931A17E50B44505D32878CB4E86
+  paid by: rMfzwn6ogexc9VFbRMxayfZKRxJd8SXcGu
+Checked 2 pending requests: 1 newly marked paid, 1 still pending.
+
+$ python xrpcli.py watch
+Checked 1 pending request: 0 newly marked paid, 1 still pending.
+```
